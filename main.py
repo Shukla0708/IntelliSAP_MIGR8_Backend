@@ -6,8 +6,8 @@ from urllib.parse import unquote
 from config import settings
 from db.database import engine
 from db.models import Base
-from routers import auth, projects, validation, mapping, chat
-from services import s3_service
+from routers import auth, projects, validation, mapping, chat, comparison
+from services import s3_service, job_queue
 
 app = FastAPI(title="MIGR8 AI — Validation API")
 
@@ -27,6 +27,7 @@ app.include_router(projects.router)
 app.include_router(validation.router)
 app.include_router(mapping.router)
 app.include_router(chat.router)
+app.include_router(comparison.router)
 
 
 @app.on_event("startup")
@@ -34,6 +35,12 @@ def on_startup():
     # For the hackathon: auto-create tables if they don't exist.
     # In practice, run schema.sql directly against Postgres instead.
     Base.metadata.create_all(bind=engine)
+    job_queue.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    job_queue.stop()
 
 
 @app.get("/health")

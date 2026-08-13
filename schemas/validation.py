@@ -67,4 +67,8 @@ class RunDetailOut(BaseModel):
     status: str
     source_filename: Optional[str] = None
     has_source_file: bool
+    processed_rows: int = 0
+    total_rows: int = 0
+    error_message: Optional[str] = None
+    has_result_file: bool = False
     fields: list[RunFieldOut]

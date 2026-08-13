@@ -29,6 +29,7 @@ class ValidationProject(Base):
     user = relationship("User", back_populates="projects")
     runs = relationship("ValidationRun", back_populates="project", cascade="all, delete-orphan")
     mappings = relationship("Mapping", cascade="all, delete-orphan")
+    comparisons = relationship("ComparisonRun", back_populates="project", cascade="all, delete-orphan")
 
 
 class ValidationRun(Base):
@@ -54,6 +55,10 @@ class ValidationRun(Base):
 
     errors_by_type = Column(JSONB, default=list)
     errors_by_field = Column(JSONB, default=list)
+
+    processed_rows = Column(Integer, default=0)
+    total_rows = Column(Integer, default=0)
+    error_message = Column(Text)
 
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
@@ -148,3 +153,55 @@ class FinalMapping(Base):
     source_field = Column(String, nullable=False)
     target_field = Column(String, nullable=False)  # "{sap_table}.{sap_field}"
     key = Column(Boolean, default=False)
+
+
+class ComparisonRun(Base):
+    __tablename__ = "comparison_runs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_comparison_runs_project_name"),
+    )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("validation_projects.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(120), nullable=False)
+    status = Column(String, default="draft")
+
+    preload_filename = Column(String)
+    preload_s3_key = Column(String)
+    postload_filename = Column(String)
+    postload_s3_key = Column(String)
+    result_s3_key = Column(String)
+
+    mapping_id = Column(UUID(as_uuid=True), ForeignKey("mappings.id", ondelete="SET NULL"))
+    join_keys = Column(JSONB, default=list)
+
+    processed_rows = Column(Integer, default=0)
+    total_rows = Column(Integer, default=0)
+    error_message = Column(Text)
+
+    matched_records = Column(Integer, default=0)
+    different_count = Column(Integer, default=0)
+    missing_count = Column(Integer, default=0)
+    extra_count = Column(Integer, default=0)
+    match_rate = Column(Numeric(5, 2), default=0)
+
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    ran_at = Column(TIMESTAMP(timezone=True))
+    completed_at = Column(TIMESTAMP(timezone=True))
+
+    project = relationship("ValidationProject", back_populates="comparisons")
+    exceptions = relationship("ComparisonException", cascade="all, delete-orphan")
+
+
+class ComparisonException(Base):
+    __tablename__ = "comparison_exceptions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id = Column(UUID(as_uuid=True), ForeignKey("comparison_runs.id", ondelete="CASCADE"))
+    row_number = Column(Integer, nullable=False)
+    business_key = Column(Text, nullable=False)
+    field_name = Column(String, nullable=False)
+    preload_value = Column(Text)
+    postload_value = Column(Text)
+    difference_type = Column(String, nullable=False)
+    severity = Column(String, default="warning")
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)

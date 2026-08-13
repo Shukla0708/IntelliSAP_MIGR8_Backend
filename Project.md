@@ -391,7 +391,7 @@ pytest tests/ -q
 
 1. **Bearer JWT** in `Authorization` header — no server-side session store.
 2. **CamelCase in auth JSON** (`fullName`); field rules use snake_case on the wire.
-3. **Sync execute** for demo-sized files; large files should move to a background job.
+3. **Async execute** for validation and comparison — `POST .../execute` returns **202** and a worker writes progress; poll `GET` until `completed`.
 4. **`schema.sql` is source of truth** for constraints; SQLAlchemy `create_all` is a hackathon shortcut.
 5. **Never log secrets** from `.env`.
 6. Keep routers thin; business logic in `services/`.
@@ -408,7 +408,7 @@ pytest tests/ -q
 
 ## Open Questions / TBD
 
-- Background job for `execute` (Celery / RQ / BackgroundTasks)
+- Background job for `execute` (Celery / RQ) if uvicorn `--reload` or multiple workers start duplicating jobs
 - Password reset
 - Stricter alignment of auto-created tables with `schema.sql` CHECKs
 - Server-side auth (httpOnly cookie) so results can SSR — frontend currently uses Bearer + readable cookie for middleware
@@ -425,6 +425,14 @@ pytest tests/ -q
 ---
 
 ## Session Log
+
+### 2026-08-14 — Large-file validation + preload/postload comparison
+
+- `POST /api/runs/{id}/execute` returns **202**; in-process worker validates and writes a full annotated XLSX.
+- Progress columns on `validation_runs`: `processed_rows`, `total_rows`, `error_message` (`migrations/003_run_progress.sql`).
+- Streaming engine: CSV/XLSX via `file_stream` + `xlsxwriter` (no in-place openpyxl mutate).
+- Comparison API `/api/comparisons/*` with Polars hash-join (`migrations/004_comparison_runs.sql`).
+- Tests: `tests/test_large_file.py` plus existing composite-key tests.
 
 ### 2026-08-13 — Results chatbot (grounded Q&A)
 

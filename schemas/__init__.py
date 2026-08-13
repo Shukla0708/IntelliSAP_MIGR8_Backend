@@ -11,6 +11,7 @@ from schemas.validation import (
 )
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
 from schemas.chat import ChatRequest, ChatResponse, ChatContextIn, ChatTurn
+from schemas.comparison import CreateComparisonRequest
 
 __all__ = [
     "RegisterRequest",
@@ -32,4 +33,5 @@ __all__ = [
     "ChatResponse",
     "ChatContextIn",
     "ChatTurn",
+    "CreateComparisonRequest",
 ]

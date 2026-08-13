@@ -2,13 +2,14 @@ import logging
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db.database import get_db
 from db.models import User, ValidationRun, ValidationField, ValidationException, ValidationProject
 from auth import get_current_user
-from services import excel_service, s3_service, regex_generator
+from services import s3_service, regex_generator, file_stream, job_queue
 from schemas import (
     CreateRunRequest,
     FieldRuleIn,
@@ -132,6 +133,10 @@ def get_run(
         status=run.status or "draft",
         source_filename=run.source_filename,
         has_source_file=bool(run.source_s3_key),
+        processed_rows=run.processed_rows or 0,
+        total_rows=run.total_rows or 0,
+        error_message=run.error_message,
+        has_result_file=bool(run.result_s3_key),
         fields=[
             RunFieldOut(
                 field_name=f.field_name,
@@ -159,18 +164,36 @@ async def upload_source(run_id: uuid.UUID, file: UploadFile = File(...),
                          db: Session = Depends(get_db),
                          current_user: User = Depends(get_current_user)):
     run = _get_owned_run(run_id, db, current_user)
+    filename = file.filename or "source.xlsx"
+    try:
+        file_stream.sniff_kind(filename)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
-    content = await file.read()
-    key = f"validations/{run_id}/source/{file.filename}"
-    s3_service.upload_bytes(key, content, file.content_type or "application/octet-stream")
+    key = f"validations/{run_id}/source/{filename}"
+    await file.seek(0)
+    s3_service.upload_fileobj(
+        key, file.file, file.content_type or "application/octet-stream",
+    )
 
-    fields = excel_service.extract_headers(content)
+    stored = s3_service.local_path_if_exists(key)
+    if stored:
+        fields = file_stream.extract_headers_from_path(stored, filename)
+    else:
+        tmp = s3_service.download_to_temp(key, suffix="." + filename.rsplit(".", 1)[-1])
+        try:
+            fields = file_stream.extract_headers_from_path(tmp, filename)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    if not fields:
+        raise HTTPException(422, "No column headers found in the first row.")
 
     db.query(ValidationField).filter(ValidationField.run_id == run_id).delete()
     for idx, name in enumerate(fields):
         db.add(ValidationField(run_id=run_id, field_name=name, column_index=idx))
 
-    run.source_filename = file.filename
+    run.source_filename = filename
     run.source_s3_key = key
     run.status = "draft"
     db.commit()
@@ -241,49 +264,17 @@ def execute_run(run_id: uuid.UUID, db: Session = Depends(get_db),
     run = _get_owned_run(run_id, db, current_user)
     if not run.source_s3_key:
         raise HTTPException(400, "No source file uploaded for this run")
+    if run.status == "running":
+        raise HTTPException(status.HTTP_409_CONFLICT, "This run is already executing")
 
     run.status = "running"
     run.ran_at = datetime.utcnow()
+    run.processed_rows = 0
+    run.total_rows = 0
+    run.error_message = None
     db.commit()
-
-    field_rows = db.query(ValidationField).filter_by(run_id=run_id).all()
-    field_configs = [{
-        "field_name": f.field_name,
-        "flag_key": f.flag_key, "flag_mandatory": f.flag_mandatory,
-        "flag_null": f.flag_null, "flag_email": f.flag_email,
-        "flag_mobile": f.flag_mobile, "flag_date": f.flag_date,
-        "flag_special_chars": f.flag_special_chars,
-        "case_format": f.case_format, "data_type": f.data_type,
-        "max_length": f.max_length, "decimal_length": f.decimal_length,
-        "regex": f.regex,
-    } for f in field_rows]
-
-    try:
-        source_bytes = s3_service.download_bytes(run.source_s3_key)
-        result_bytes, stats, exceptions = excel_service.run_validation(source_bytes, field_configs)
-
-        result_key = f"validations/{run_id}/result/{run.source_filename}"
-        s3_service.upload_bytes(
-            result_key, result_bytes,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        db.query(ValidationException).filter_by(run_id=run_id).delete()
-        for e in exceptions:
-            db.add(ValidationException(run_id=run_id, **e))
-
-        for k, v in stats.items():
-            setattr(run, k, v)
-        run.result_s3_key = result_key
-        run.status = "completed"
-        run.completed_at = datetime.utcnow()
-        db.commit()
-    except Exception as exc:
-        run.status = "failed"
-        db.commit()
-        raise HTTPException(500, f"Validation run failed: {exc}")
-
-    return {"run_id": str(run_id), "status": "completed"}
+    job_queue.submit_validation(run_id)
+    return JSONResponse({"run_id": str(run_id), "status": "running"}, status_code=202)
 
 
 @router.get("/{run_id}/result")
@@ -319,6 +310,10 @@ def get_result(run_id: uuid.UUID, db: Session = Depends(get_db),
         "errorsByType": run.errors_by_type,
         "errorsByField": run.errors_by_field,
         "status": run.status,
+        "processedRows": run.processed_rows or 0,
+        "totalRows": run.total_rows or 0,
+        "errorMessage": run.error_message,
+        "hasResultFile": bool(run.result_s3_key),
         "exceptions": [{
             "id": str(e.id),
             "severity": e.severity,
