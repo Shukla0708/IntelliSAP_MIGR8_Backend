@@ -5,10 +5,12 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import User, ValidationProject, Mapping, MappingTemp, FinalMapping
 from auth import get_current_user
-from schemas import ConfirmMappingRequest
+from schemas import ConfirmMappingRequest, RenameMappingRequest
 from services import s3_service, file_parser, mapping_engine, llm_mapping, datatype_matcher
 
 NUMBER_RANGE_TYPES = ("internal", "external")
+DEFAULT_MAPPING_NAME = "New field mapping run"
+MAX_MAPPING_NAME_LENGTH = 120
 
 router = APIRouter(prefix="/api/mappings", tags=["field-mapping"])
 
@@ -24,6 +26,29 @@ def _get_owned_mapping(run_id: uuid.UUID, db: Session, current_user: User) -> Ma
     if not project or project.user_id != current_user.id:
         raise HTTPException(404, "Mapping run not found")
     return mapping
+
+
+def _clean_mapping_name(raw: str | None) -> str | None:
+    """Trimmed run name, or None when the caller left it blank."""
+    name = (raw or "").strip()
+    if not name:
+        return None
+    if len(name) > MAX_MAPPING_NAME_LENGTH:
+        raise HTTPException(422, f"Mapping name must be at most {MAX_MAPPING_NAME_LENGTH} characters")
+    return name
+
+
+def _target_catalog(mapping: Mapping) -> list[dict]:
+    """Every SAP field from the run's uploaded target list, not just the AI's top-3."""
+    if not mapping.target_s3_key or not mapping.target_filename:
+        raise HTTPException(404, "This mapping run has no stored target field list")
+    try:
+        target_bytes = s3_service.download_bytes(mapping.target_s3_key)
+        return file_parser.parse_target_fields(target_bytes, mapping.target_filename)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"Could not read the target field list: {exc}")
 
 
 def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_field: dict | None = None) -> dict:
@@ -49,6 +74,7 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_fiel
 
     return {
         "mappingRunId": str(mapping.id),
+        "mappingName": mapping.mapping_name,
         "status": mapping.status,
         "numberRangeType": mapping.number_range_type,
         "sourceFilename": mapping.source_filename,
@@ -111,6 +137,7 @@ def list_mapping_runs(
 async def create_mapping_run(
     project_id: uuid.UUID,
     number_range_type: str = Form(...),
+    mapping_name: str | None = Form(None),
     source_file: UploadFile = File(...),
     target_file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -123,7 +150,12 @@ async def create_mapping_run(
     if not project or project.user_id != current_user.id:
         raise HTTPException(404, "Project not found")
 
-    mapping = Mapping(project_id=project_id, status="processing", number_range_type=number_range_type)
+    mapping = Mapping(
+        project_id=project_id,
+        mapping_name=_clean_mapping_name(mapping_name) or DEFAULT_MAPPING_NAME,
+        status="processing",
+        number_range_type=number_range_type,
+    )
     db.add(mapping)
     db.commit()
     db.refresh(mapping)
@@ -224,12 +256,52 @@ def get_mapping_result(run_id: uuid.UUID, db: Session = Depends(get_db),
     return _serialize(mapping, temp_rows, confirmed_by_field)
 
 
+@router.patch("/{run_id}")
+def rename_mapping_run(run_id: uuid.UUID, payload: RenameMappingRequest, db: Session = Depends(get_db),
+                        current_user: User = Depends(get_current_user)):
+    mapping = _get_owned_mapping(run_id, db, current_user)
+
+    name = _clean_mapping_name(payload.mapping_name)
+    if not name:
+        raise HTTPException(422, "Mapping name cannot be empty")
+
+    mapping.mapping_name = name
+    db.commit()
+    return {"mappingRunId": str(mapping.id), "mappingName": mapping.mapping_name}
+
+
+@router.get("/{run_id}/target-fields")
+def list_target_fields(run_id: uuid.UUID, db: Session = Depends(get_db),
+                        current_user: User = Depends(get_current_user)):
+    """Full SAP target catalog for the run, so users can map outside the top-3."""
+    mapping = _get_owned_mapping(run_id, db, current_user)
+
+    return [
+        {
+            "targetField": f"{t['sap_table']}.{t['sap_field']}",
+            "sapTable": t["sap_table"],
+            "sapField": t["sap_field"],
+            "targetDescription": t.get("description"),
+            "datatype": t.get("datatype"),
+        }
+        for t in _target_catalog(mapping)
+    ]
+
+
 @router.post("/{run_id}/confirm")
 def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Session = Depends(get_db),
                      current_user: User = Depends(get_current_user)):
     mapping = _get_owned_mapping(run_id, db, current_user)
 
     temp_by_field = {t.source_field: t for t in db.query(MappingTemp).filter_by(mapping_id=mapping.id).all()}
+
+    # Users may map to any field in the uploaded target list, not just the AI's
+    # top-3, so the catalog is the source of truth here. If it can't be read we
+    # fall back to the per-row candidates.
+    try:
+        catalog_keys = {f"{t['sap_table']}.{t['sap_field']}" for t in _target_catalog(mapping)}
+    except HTTPException:
+        catalog_keys = set()
 
     confirmed = []
     for item in payload.fields:
@@ -238,9 +310,9 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
             raise HTTPException(404, f"Source field '{item.source_field}' not found in this mapping run")
 
         candidate_keys = {f"{c['sap_table']}.{c['sap_field']}" for c in (temp.mapping or [])}
-        if item.target_field not in candidate_keys:
+        if item.target_field not in candidate_keys and item.target_field not in catalog_keys:
             raise HTTPException(
-                422, f"'{item.target_field}' is not a suggested candidate for '{item.source_field}'"
+                422, f"'{item.target_field}' is not a field in this run's target list"
             )
 
         existing = db.query(FinalMapping).filter_by(
