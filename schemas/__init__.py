@@ -10,6 +10,13 @@ from schemas.validation import (
     RunFieldOut,
 )
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest, RenameMappingRequest
+from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
+from schemas.comparison import (
+    ComparisonDiscrepancyOut,
+    ComparisonReviewOut,
+    CreateComparisonRequest,
+    ExecuteComparisonRequest,
+)
 from schemas.chat import ChatRequest, ChatResponse, ChatContextIn, ChatTurn
 
 __all__ = [
@@ -29,6 +36,10 @@ __all__ = [
     "ConfirmedFieldIn",
     "ConfirmMappingRequest",
     "RenameMappingRequest",
+    "ComparisonDiscrepancyOut",
+    "ComparisonReviewOut",
+    "CreateComparisonRequest",
+    "ExecuteComparisonRequest",
     "ChatRequest",
     "ChatResponse",
     "ChatContextIn",

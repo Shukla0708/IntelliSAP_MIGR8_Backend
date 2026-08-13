@@ -49,6 +49,10 @@ def _target_catalog(mapping: Mapping) -> list[dict]:
         raise
     except Exception as exc:
         raise HTTPException(422, f"Could not read the target field list: {exc}")
+def confirmed_counts(db: Session, mapping_id: uuid.UUID) -> tuple[int, int]:
+    """(confirmed fields, key fields) — key fields form the comparison business key."""
+    flags = [row for (row,) in db.query(FinalMapping.key).filter_by(mapping_id=mapping_id).all()]
+    return len(flags), sum(1 for is_key in flags if is_key)
 
 
 def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_field: dict | None = None) -> dict:
@@ -93,6 +97,8 @@ def list_mapping_runs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Mapping runs owned by the caller, newest first. `project_id` narrows to one
+    project; the comparison setup screen also reads the key counts from here."""
     if project_id is not None:
         project = db.get(ValidationProject, project_id)
         if not project or project.user_id != current_user.id:
@@ -109,15 +115,12 @@ def list_mapping_runs(
     if project_id is not None:
         query = query.filter(Mapping.project_id == project_id)
 
-    runs = (
-        query.order_by(Mapping.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    rows = query.order_by(Mapping.created_at.desc()).offset(offset).limit(limit).all()
 
-    return [
-        {
+    result = []
+    for run, project in rows:
+        confirmed_field_count, key_field_count = confirmed_counts(db, run.id)
+        result.append({
             "mappingRunId": str(run.id),
             "mappingName": run.mapping_name,
             "status": run.status,
@@ -127,10 +130,11 @@ def list_mapping_runs(
             "targetFilename": run.target_filename,
             "totalSourceFields": run.total_source_fields,
             "mappedFields": run.mapped_fields,
+            "confirmedFieldCount": confirmed_field_count,
+            "keyFieldCount": key_field_count,
             "createdAt": run.created_at.isoformat() if run.created_at else None,
-        }
-        for run, project in runs
-    ]
+        })
+    return result
 
 
 @router.post("/")
@@ -286,6 +290,24 @@ def list_target_fields(run_id: uuid.UUID, db: Session = Depends(get_db),
         }
         for t in _target_catalog(mapping)
     ]
+@router.get("/{run_id}/confirmed")
+def get_confirmed_mapping(run_id: uuid.UUID, db: Session = Depends(get_db),
+                           current_user: User = Depends(get_current_user)):
+    mapping = _get_owned_mapping(run_id, db, current_user)
+    rows = (
+        db.query(FinalMapping)
+        .filter_by(mapping_id=mapping.id)
+        .order_by(FinalMapping.source_field)
+        .all()
+    )
+    return {
+        "mappingRunId": str(mapping.id),
+        "fields": [{
+            "sourceField": row.source_field,
+            "targetField": row.target_field,
+            "isKey": bool(row.key),
+        } for row in rows],
+    }
 
 
 @router.post("/{run_id}/confirm")
@@ -334,5 +356,9 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
     db.commit()
     return {
         "mappingRunId": str(mapping.id),
-        "confirmed": [{"sourceField": c.source_field, "targetField": c.target_field} for c in confirmed],
+        "confirmed": [{
+            "sourceField": c.source_field,
+            "targetField": c.target_field,
+            "isKey": bool(c.key),
+        } for c in confirmed],
     }

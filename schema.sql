@@ -121,6 +121,8 @@ CREATE TABLE mappings (
     mapping_name        TEXT NOT NULL DEFAULT 'New field mapping run',
     status              TEXT NOT NULL DEFAULT 'processing'
                          CHECK (status IN ('processing','completed','failed')),
+    number_range_type   VARCHAR(20)          -- internal | external, chosen at run start
+                         CHECK (number_range_type IN ('internal','external')),
 
     source_filename     TEXT,
     source_s3_key       TEXT,
@@ -144,20 +146,86 @@ CREATE TABLE mapping_temp (
     mapping_id          UUID NOT NULL REFERENCES mappings(id) ON DELETE CASCADE,
 
     source_field        TEXT NOT NULL,
+    key_field           BOOLEAN DEFAULT false,  -- flagged as a key in the source file
     mapping             JSONB NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX idx_mapping_temp_mapping_id ON mapping_temp(mapping_id);
 
 -- User-confirmed source -> target field mapping, one row per confirmed source field.
+-- "key" is carried over from mapping_temp.key_field on confirm. Several fields may
+-- carry key = true; together they form the composite business key used to join
+-- preload and postload rows during comparison.
 CREATE TABLE final_mapping (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     mapping_id          UUID NOT NULL REFERENCES mappings(id) ON DELETE CASCADE,
 
     source_field        TEXT NOT NULL,
     target_field        TEXT NOT NULL,      -- "{sap_table}.{sap_field}"
+    key                 BOOLEAN DEFAULT false,
 
     UNIQUE (mapping_id, source_field)
 );
 
 CREATE INDEX idx_final_mapping_mapping_id ON final_mapping(mapping_id);
+CREATE INDEX idx_final_mapping_key ON final_mapping(mapping_id) WHERE key = true;
+
+-- ------------------------------------------------------------
+-- Preload vs postload comparison — one upload pair -> execute cycle
+-- ------------------------------------------------------------
+CREATE TABLE comparison_runs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          UUID NOT NULL REFERENCES validation_projects(id) ON DELETE CASCADE,
+    name                VARCHAR(120) NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'draft'
+                         CHECK (status IN ('draft','running','completed','failed')),
+
+    -- NULL = compare columns that share a name in both files
+    mapping_id          UUID REFERENCES mappings(id) ON DELETE SET NULL,
+    -- Explicit composite key override used when no mapping is selected
+    business_key_columns_preload    JSONB NOT NULL DEFAULT '[]',
+    business_key_columns_postload   JSONB NOT NULL DEFAULT '[]',
+
+    preload_filename    TEXT,
+    preload_s3_key      TEXT,
+    postload_filename   TEXT,
+    postload_s3_key     TEXT,
+    result_s3_key       TEXT,
+
+    total_preload_rows  INT DEFAULT 0,
+    total_postload_rows INT DEFAULT 0,
+    matched_records     INT DEFAULT 0,
+    different_count     INT DEFAULT 0,
+    missing_count       INT DEFAULT 0,
+    match_rate          NUMERIC(5,2) DEFAULT 0,
+
+    created_by          UUID REFERENCES users(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ran_at              TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+
+    CONSTRAINT uq_comparison_runs_project_name UNIQUE (project_id, name)
+);
+
+CREATE INDEX idx_comparison_runs_project_id ON comparison_runs(project_id);
+CREATE INDEX idx_comparison_runs_status ON comparison_runs(status);
+
+-- ------------------------------------------------------------
+-- Capped discrepancy list (top 50 rows shown on the review page)
+-- ------------------------------------------------------------
+CREATE TABLE comparison_discrepancies (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id              UUID NOT NULL REFERENCES comparison_runs(id) ON DELETE CASCADE,
+    row_number          INT NOT NULL,
+    business_key        TEXT NOT NULL,
+    field_name          TEXT NOT NULL,
+    field_italic        BOOLEAN NOT NULL DEFAULT false,
+    preload_value       TEXT,
+    postload_value      TEXT,
+    difference_type     TEXT NOT NULL,
+    severity            TEXT NOT NULL DEFAULT 'warning'
+                         CHECK (severity IN ('error','warning','info')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_comparison_discrepancies_run_id ON comparison_discrepancies(run_id);

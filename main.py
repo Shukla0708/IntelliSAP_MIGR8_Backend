@@ -6,7 +6,7 @@ from urllib.parse import unquote
 from config import settings
 from db.database import engine
 from db.models import Base
-from routers import auth, projects, validation, mapping, chat
+from routers import auth, projects, validation, mapping, comparison, chat
 from services import s3_service
 
 app = FastAPI(title="MIGR8 AI — Validation API")
@@ -26,6 +26,7 @@ app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(validation.router)
 app.include_router(mapping.router)
+app.include_router(comparison.router)
 app.include_router(chat.router)
 
 
