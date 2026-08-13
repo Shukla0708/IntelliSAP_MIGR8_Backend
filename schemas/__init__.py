@@ -9,6 +9,7 @@ from schemas.validation import (
     RunDetailOut,
     RunFieldOut,
 )
+from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest, RenameMappingRequest
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
 from schemas.comparison import (
     ComparisonDiscrepancyOut,
@@ -34,6 +35,7 @@ __all__ = [
     "RunFieldOut",
     "ConfirmedFieldIn",
     "ConfirmMappingRequest",
+    "RenameMappingRequest",
     "ComparisonDiscrepancyOut",
     "ComparisonReviewOut",
     "CreateComparisonRequest",

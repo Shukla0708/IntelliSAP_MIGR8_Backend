@@ -8,3 +8,7 @@ class ConfirmedFieldIn(BaseModel):
 
 class ConfirmMappingRequest(BaseModel):
     fields: list[ConfirmedFieldIn]
+
+
+class RenameMappingRequest(BaseModel):
+    mapping_name: str
