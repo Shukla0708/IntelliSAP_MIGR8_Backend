@@ -73,7 +73,7 @@ backend/
     ├── rules_engine.py
     ├── regex_generator.py
     ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
-    ├── embedding_service.py # local TF-IDF vectorizer, numpy only (mapping)
+    ├── embedding_service.py # Cohere Embed v4 on Bedrock (TF-IDF fallback)
     ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
     ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
     └── datatype_matcher.py  # hardcoded SAP-type compatibility matrix (mapping)
@@ -98,6 +98,8 @@ Copy `.env.example` → `.env`:
 | `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` — use `s3` on EC2 |
 | `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
 | `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` — regex + mapping LLM |
+| `BEDROCK_EMBED_MODEL_ID` | no | Default `cohere.embed-v4:0` — field-mapping embeddings |
+| `EMBEDDING_BACKEND` | no | `auto` (Cohere if Bedrock creds) \| `bedrock` \| `local` |
 | `CORS_ORIGINS` | no | Comma-separated frontend origins (add EC2 URL on deploy) |
 
 CORS origins are read from `CORS_ORIGINS` in `.env` (comma-separated). Default includes localhost ports. On EC2, add `http://<ec2-ip>:3000` (or your nginx domain).
@@ -255,7 +257,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Bedroc
 
 ### `embedding_service` (mapping)
 
-`embed_texts(list[str]) -> np.ndarray` — local character-trigram + word-bigram TF-IDF vectorizer, numpy only, no model download. Swap target: **fastembed** (`BAAI/bge-small-en-v1.5`) or **Cohere Embed v4** (`cohere.embed-v4:0`) — same function signature.
+`embed_texts(list[str]) -> np.ndarray` — **Cohere Embed v4** on Bedrock (`BEDROCK_EMBED_MODEL_ID`, default `cohere.embed-v4:0`) via InvokeModel, same creds as Claude (`BEDROCK_ACCESS_KEY` or IAM). Batches of 96. L2-normalized rows. Falls back to local TF-IDF when `EMBEDDING_BACKEND=local` or no Bedrock credentials.
 
 ### `mapping_engine` (mapping)
 

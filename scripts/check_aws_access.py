@@ -91,6 +91,20 @@ def check_bedrock() -> bool:
         return False
 
 
+def check_bedrock_embed() -> bool:
+    print("\n3b) Bedrock Cohere Embed v4")
+    print(f"     Model: {settings.bedrock_embed_model_id}")
+    try:
+        from services import embedding_service
+        matrix = embedding_service.embed_texts(["customer name", "order date"])
+        ok(f"embed_texts succeeded — shape {matrix.shape}")
+        return True
+    except Exception as exc:
+        fail(str(exc))
+        warn("Enable Cohere Embed v4 (cohere.embed-v4:0) in Bedrock model access")
+        return False
+
+
 def check_database() -> bool:
     print("\n4) PostgreSQL (DATABASE_URL)")
     url = settings.database_url
@@ -124,6 +138,7 @@ def main() -> int:
         check_aws_identity(),
         check_s3(),
         check_bedrock(),
+        check_bedrock_embed(),
         check_database(),
     ]
 

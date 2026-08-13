@@ -42,6 +42,8 @@ def health():
         "storage": s3_service.storage_mode(),
         "llm": "bedrock",
         "model": settings.bedrock_model_id,
+        "embed_model": settings.bedrock_embed_model_id,
+        "embedding_backend": settings.embedding_backend,
         "bedrock_region": settings.bedrock_region,
     }
 

@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # Optional Bedrock API key (ABSK...) — bypasses IAM for bedrock-runtime when set
     bedrock_access_key: str | None = None
     bedrock_model_id: str = "us.anthropic.claude-sonnet-5"
+    bedrock_embed_model_id: str = "cohere.embed-v4:0"
+    # auto | bedrock | local — auto uses Cohere when Bedrock creds exist
+    embedding_backend: str = "auto"
     # Bedrock endpoint region (us.* models → us-east-1; separate from AWS_REGION for S3/RDS)
     bedrock_region: str = "us-east-1"
     cors_origins: str = _DEFAULT_CORS
