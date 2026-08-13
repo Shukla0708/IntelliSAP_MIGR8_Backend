@@ -1,12 +1,14 @@
 import uuid
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from db.database import get_db
 from db.models import User, ValidationProject, Mapping, MappingTemp, FinalMapping
 from auth import get_current_user
 from schemas import ConfirmMappingRequest
-from services import s3_service, file_parser, mapping_engine, llm_mapping
+from services import s3_service, file_parser, mapping_engine, llm_mapping, datatype_matcher
+
+NUMBER_RANGE_TYPES = ("internal", "external")
 
 router = APIRouter(prefix="/api/mappings", tags=["field-mapping"])
 
@@ -24,7 +26,8 @@ def _get_owned_mapping(run_id: uuid.UUID, db: Session, current_user: User) -> Ma
     return mapping
 
 
-def _serialize(mapping: Mapping, temp_rows: list[MappingTemp]) -> dict:
+def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_field: dict | None = None) -> dict:
+    confirmed_by_field = confirmed_by_field or {}
     rows = []
     for t in temp_rows:
         prospects = [{
@@ -37,11 +40,17 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp]) -> dict:
             "confidence": c.get("confidence_score"),
             "reasoning": c.get("reasoning"),
         } for c in (t.mapping or [])]
-        rows.append({"sourceField": t.source_field, "prospects": prospects})
+        rows.append({
+            "sourceField": t.source_field,
+            "keyField": t.key_field,
+            "prospects": prospects,
+            "confirmedTargetField": confirmed_by_field.get(t.source_field),
+        })
 
     return {
         "mappingRunId": str(mapping.id),
         "status": mapping.status,
+        "numberRangeType": mapping.number_range_type,
         "sourceFilename": mapping.source_filename,
         "targetFilename": mapping.target_filename,
         "totalSourceFields": mapping.total_source_fields,
@@ -50,11 +59,11 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp]) -> dict:
     }
 
 
-@router.post("/")
-async def create_mapping_run(
+@router.get("/")
+def list_mapping_runs(
     project_id: uuid.UUID,
-    source_file: UploadFile = File(...),
-    target_file: UploadFile = File(...),
+    limit: int = 50,
+    offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -62,7 +71,50 @@ async def create_mapping_run(
     if not project or project.user_id != current_user.id:
         raise HTTPException(404, "Project not found")
 
-    mapping = Mapping(project_id=project_id, status="processing")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    runs = (
+        db.query(Mapping)
+        .filter(Mapping.project_id == project_id)
+        .order_by(Mapping.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "mappingRunId": str(run.id),
+            "mappingName": run.mapping_name,
+            "status": run.status,
+            "sourceFilename": run.source_filename,
+            "targetFilename": run.target_filename,
+            "totalSourceFields": run.total_source_fields,
+            "mappedFields": run.mapped_fields,
+            "createdAt": run.created_at.isoformat() if run.created_at else None,
+        }
+        for run in runs
+    ]
+
+
+@router.post("/")
+async def create_mapping_run(
+    project_id: uuid.UUID,
+    number_range_type: str = Form(...),
+    source_file: UploadFile = File(...),
+    target_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if number_range_type not in NUMBER_RANGE_TYPES:
+        raise HTTPException(422, "number_range_type must be 'internal' or 'external'")
+
+    project = db.get(ValidationProject, project_id)
+    if not project or project.user_id != current_user.id:
+        raise HTTPException(404, "Project not found")
+
+    mapping = Mapping(project_id=project_id, status="processing", number_range_type=number_range_type)
     db.add(mapping)
     db.commit()
     db.refresh(mapping)
@@ -94,28 +146,47 @@ async def create_mapping_run(
         db.query(MappingTemp).filter_by(mapping_id=mapping.id).delete()
         mapped_fields = 0
         for match in raw_matches:
-            try:
-                final_candidates = llm_mapping.rank_candidates(
-                    match["source_field"], match["source_description"], match["candidates"]
-                )
-            except Exception:
-                # LLM unavailable/invalid response — fall back to embedding-only ranking
-                final_candidates = [{
-                    "sap_table": c["sap_table"],
-                    "sap_field": c["sap_field"],
-                    "target_description": c.get("target_description"),
-                    "embedding_score": c["embedding_score"],
-                    "datatype_match_score": c.get("datatype_match_score"),
-                    "confidence_score": round(c["embedding_score"] * 100, 2),
-                    "reasoning": "LLM ranking unavailable; ranked by embedding similarity only.",
-                } for c in match["candidates"]]
+            is_manual_key = number_range_type == "internal" and match["key_field"]
 
-            if final_candidates:
-                mapped_fields += 1
+            if is_manual_key:
+                # Internal number range: SAP assigns this key itself, so the AI
+                # must not pre-map it — hand the user the full target catalog
+                # to search and pick from instead.
+                final_candidates = [{
+                    "sap_table": t["sap_table"],
+                    "sap_field": t["sap_field"],
+                    "target_description": t.get("description"),
+                    "embedding_score": None,
+                    "datatype_match_score": datatype_matcher.datatype_match_score(
+                        match["datatype"], t.get("datatype")
+                    ),
+                    "confidence_score": None,
+                    "reasoning": "Key field under an internal number range — map this manually.",
+                } for t in target_fields]
+            else:
+                try:
+                    final_candidates = llm_mapping.rank_candidates(
+                        match["source_field"], match["source_description"], match["candidates"]
+                    )
+                except Exception:
+                    # LLM unavailable/invalid response — fall back to embedding-only ranking
+                    final_candidates = [{
+                        "sap_table": c["sap_table"],
+                        "sap_field": c["sap_field"],
+                        "target_description": c.get("target_description"),
+                        "embedding_score": c["embedding_score"],
+                        "datatype_match_score": c.get("datatype_match_score"),
+                        "confidence_score": round(c["embedding_score"] * 100, 2),
+                        "reasoning": "LLM ranking unavailable; ranked by embedding similarity only.",
+                    } for c in match["candidates"]]
+
+                if final_candidates:
+                    mapped_fields += 1
 
             db.add(MappingTemp(
                 mapping_id=mapping.id,
                 source_field=match["source_field"],
+                key_field=match["key_field"],
                 mapping=final_candidates,
             ))
 
@@ -137,7 +208,11 @@ def get_mapping_result(run_id: uuid.UUID, db: Session = Depends(get_db),
                         current_user: User = Depends(get_current_user)):
     mapping = _get_owned_mapping(run_id, db, current_user)
     temp_rows = db.query(MappingTemp).filter_by(mapping_id=run_id).all()
-    return _serialize(mapping, temp_rows)
+    confirmed_by_field = {
+        f.source_field: f.target_field
+        for f in db.query(FinalMapping).filter_by(mapping_id=run_id).all()
+    }
+    return _serialize(mapping, temp_rows, confirmed_by_field)
 
 
 @router.post("/{run_id}/confirm")
@@ -164,9 +239,13 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
         ).first()
         if existing:
             existing.target_field = item.target_field
+            existing.key = temp.key_field
         else:
             existing = FinalMapping(
-                mapping_id=mapping.id, source_field=item.source_field, target_field=item.target_field
+                mapping_id=mapping.id,
+                source_field=item.source_field,
+                target_field=item.target_field,
+                key=temp.key_field,
             )
             db.add(existing)
         confirmed.append(existing)

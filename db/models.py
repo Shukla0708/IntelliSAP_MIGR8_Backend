@@ -108,6 +108,7 @@ class Mapping(Base):
     project_id = Column(UUID(as_uuid=True), ForeignKey("validation_projects.id", ondelete="CASCADE"), nullable=False)
     mapping_name = Column(String, default="New field mapping run")
     status = Column(String, default="processing")  # processing | completed | failed
+    number_range_type = Column(String)  # internal | external
 
     source_filename = Column(String)
     source_s3_key = Column(String)
@@ -130,6 +131,7 @@ class MappingTemp(Base):
     mapping_id = Column(UUID(as_uuid=True), ForeignKey("mappings.id", ondelete="CASCADE"))
 
     source_field = Column(String, nullable=False)
+    key_field = Column(Boolean, default=False)
     # One entry per top-3 candidate: sap_table, sap_field, target_description,
     # embedding_score, datatype_match_score, confidence_score, reasoning.
     mapping = Column(JSONB, default=list)
@@ -145,3 +147,4 @@ class FinalMapping(Base):
 
     source_field = Column(String, nullable=False)
     target_field = Column(String, nullable=False)  # "{sap_table}.{sap_field}"
+    key = Column(Boolean, default=False)

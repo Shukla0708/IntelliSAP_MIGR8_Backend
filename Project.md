@@ -119,9 +119,9 @@ users 1──* validation_projects 1──* validation_runs
 | `validation_runs` | One upload → configure → execute cycle + aggregate stats; **`name` VARCHAR(120) NOT NULL**, unique per `(project_id, name)` |
 | `validation_fields` | Per-column rule flags/config for a run |
 | `validation_exceptions` | Capped failure samples (~60) for results UI |
-| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping" |
-| `mapping_temp` | One row per source field; `mapping` JSONB holds its top-3 SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
-| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row |
+| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping"; stores the chosen `number_range_type` (`internal`\|`external`) |
+| `mapping_temp` | One row per source field; `key_field` carries over the source file's Key Field flag; `mapping` JSONB holds its top-3 (or, for internal-number-range key fields, the full target catalog) SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
+| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row; `key` carries over `mapping_temp.key_field` at confirm time |
 
 **Run status:** `draft` → `rules_configured` → `running` → `completed` | `failed`
 **Mapping status:** `processing` → `completed` | `failed` (pipeline-only; confirmation is tracked separately by the presence of `final_mapping` rows, not a status value)
@@ -167,21 +167,26 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` (xlsx/csv). Creates the `mappings` row immediately ("Start Mapping"), then runs the pipeline synchronously (upload → parse → embed → top-3 → LLM re-rank → persist to `mapping_temp`) → mapping result JSON |
-| GET | `/{run_id}/result` | Bearer | Re-fetch the same result JSON from `mapping_temp` |
-| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"sourceField", "targetField"}]}`; validates each `targetField` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`) |
+| GET | `/?project_id=` | Bearer | List mapping runs for a project (`limit`/`offset` optional). Returns `[{ mappingRunId, mappingName, status, sourceFilename, targetFilename, totalSourceFields, mappedFields, createdAt }]` |
+| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` (xlsx/csv) + Form field **`number_range_type`** (`"internal"` \| `"external"`, required — 422 if missing/invalid). Creates the `mappings` row immediately ("Start Mapping"), then runs the pipeline synchronously (upload → parse → embed → top-3 → LLM re-rank → persist to `mapping_temp`) → mapping result JSON |
+| GET | `/{run_id}/result` | Bearer | Re-fetch the same result JSON from `mapping_temp`; each row also carries `confirmedTargetField` (looked up from `final_mapping`, `null` if not yet confirmed) |
+| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"source_field", "target_field"}]}` (snake_case on the wire — see schemas below); validates each `target_field` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`), carrying over `mapping_temp.key_field` into `final_mapping.key` |
 
 **Source file** must have a Field Name column, a Description column, a **Key Field flag** column, and a **Datatype** column. **Target file** must have SAP Table, SAP Field, Description, **Table Description**, and **Datatype** columns (case-insensitive, some header aliases accepted — see `file_parser.py`). Key Field flag accepts `Y/N`, `X`, `TRUE/FALSE`, `1/0`, `yes/no` (case-insensitive), normalized to boolean.
+
+**Internal vs. external number range** (chosen once per run via `number_range_type`): for a source field flagged as a Key Field, `"internal"` means SAP will assign the key itself, so the AI must **not** pre-map it — that row's `prospects` is the **entire target catalog** (every uploaded target field, not just top-3), with `semanticSimilarity`/`confidence` both `null` (only `datatypeMatchScore` is real) and a fixed `reasoning` string telling the user to map it manually. `"external"` (or any non-key field) goes through the normal embed → top-3 → LLM re-rank path regardless of `key_field`.
 
 **Response shape** (camelCase). Note `sourceDescription` is not persisted (dropped from `mapping_temp`'s columns) and is omitted from the response:
 
 ```json
 {
-  "mappingRunId": "...", "status": "completed",
+  "mappingRunId": "...", "status": "completed", "numberRangeType": "external",
   "sourceFilename": "...", "targetFilename": "...", "totalSourceFields": 42, "mappedFields": 40,
   "rows": [
     {
       "sourceField": "Customer Name",
+      "keyField": false,
+      "confirmedTargetField": null,
       "prospects": [
         {
           "targetField": "KNA1.NAME1", "sapTable": "KNA1", "sapField": "NAME1",
@@ -300,6 +305,10 @@ uvicorn main:app --reload --port 8000
 
 # Existing DB with run_name / old defaults:
 # psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql
+
+# Existing DB missing number-range/key-field columns for field mapping:
+# psql "$DATABASE_URL" -f migrations/002_field_mapping_key_and_number_range.sql
+# (or: python scripts/apply_002_field_mapping_migration.py)
 ```
 
 Smoke checks:
@@ -330,8 +339,9 @@ pytest tests/test_run_names.py -q
 11. **Date cells from Excel are typed values** — never rely on `str(datetime)` alone for format checks.
 12. **Validation run `name` is user-supplied and unique per project** — trim on input; empty → 422; unique violation → 409 with a stable detail message.
 13. **Embedding/LLM providers are behind stable function signatures on purpose** — `embedding_service.embed_texts()` (local TF-IDF now → fastembed/Cohere Embed v4 later) and `llm_mapping.rank_candidates()` (Groq now → Claude via Bedrock later) so swapping providers doesn't touch `mapping_engine`/`routers/mapping.py`.
-14. **`mapping_temp`/`final_mapping` are intentionally minimal** — `mapping_temp` only stores `id`, `mapping_id`, `source_field`, `mapping` (JSONB candidates); `final_mapping` only stores `id`, `mapping_id`, `source_field`, `target_field`. `sourceDescription` isn't persisted anywhere post-pipeline, and `final_mapping` carries no scores/reasoning/timestamps.
-15. **Mapping confirmation is per-field, not per-run** — `POST /{run_id}/confirm` accepts a list of `{sourceField, targetField}` pairs and upserts one `final_mapping` row per field (unique on `(mapping_id, source_field)`); re-confirming a field overwrites its previous choice rather than duplicating.
+14. **`mapping_temp`/`final_mapping` are intentionally minimal** — `mapping_temp` stores `id`, `mapping_id`, `source_field`, `key_field`, `mapping` (JSONB candidates); `final_mapping` stores `id`, `mapping_id`, `source_field`, `target_field`, `key`. `sourceDescription` isn't persisted anywhere post-pipeline, and `final_mapping` carries no scores/reasoning/timestamps beyond the `key` flag.
+15. **Mapping confirmation is per-field, not per-run** — `POST /{run_id}/confirm` accepts a list of `{source_field, target_field}` pairs and upserts one `final_mapping` row per field (unique on `(mapping_id, source_field)`); re-confirming a field overwrites its previous choice rather than duplicating.
+16. **`number_range_type` gates AI pre-mapping for key fields, not the whole run** — only rows where `mapping_temp.key_field` is true are affected by `"internal"` vs `"external"`; non-key rows always go through the normal ranked pipeline.
 
 ---
 
@@ -346,11 +356,18 @@ pytest tests/test_run_names.py -q
 - Field mapping: batch multiple source fields per LLM call (or queue+poll) instead of one call each, once field-list sizes grow
 - Field mapping: "Fetch from SAP" live target-table lookup isn't implemented — target field list is upload-only for now
 - Field mapping: `datatype_match_score` uses a hardcoded compatibility matrix (`services/datatype_matcher.py`); revisit if SAP type coverage needs to grow
-- Field mapping: no endpoint yet to list/edit already-confirmed `final_mapping` rows for a run (only upsert via `/confirm`)
+- Field mapping: `GET /{run_id}/result` now surfaces `confirmedTargetField` per row (read-only), but there's still no endpoint to un-confirm/delete a single `final_mapping` row — only upsert via `/confirm`
 
 ---
 
 ## Session Log
+
+### 2026-08-13 — Number-range/key-field mapping + confirmation status catch-up
+
+- Documents a feature that had already landed in code but was never written up here: `POST /api/mappings/?project_id=` now requires a `number_range_type` Form field (`internal`\|`external`); `mapping_temp.key_field`/`final_mapping.key` track which source fields are key fields (`migrations/002_field_mapping_key_and_number_range.sql`).
+- For key fields under an `internal` number range, `mapping_engine`'s pipeline is bypassed for that row — `routers/mapping.py`'s `create_mapping_run` hands back the full target catalog as `prospects` (datatype match score only, no embedding/LLM confidence) so the frontend can present a manual picker instead of an AI suggestion.
+- `GET /{run_id}/result` (`_serialize` in `routers/mapping.py`) now also joins `final_mapping` and adds `confirmedTargetField` per row (`null` if that source field hasn't been confirmed yet), so reopening a run can show which fields are already approved.
+- No breaking change to `POST /{run_id}/confirm`'s contract — it now also copies `mapping_temp.key_field` into `final_mapping.key` on upsert.
 
 ### 2026-08-13 — Field mapping feature (source → SAP target)
 
