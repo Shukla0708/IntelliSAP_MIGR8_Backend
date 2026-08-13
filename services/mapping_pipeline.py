@@ -80,7 +80,7 @@ def run_mapping_job(mapping_id: uuid.UUID) -> None:
 
         mapping.total_source_fields = len(source_fields)
         mapping.mapped_fields = mapped_fields
-        mapping.status = "completed"
+        mapping.status = "awaiting_approval"
         db.commit()
     except Exception as exc:
         db.rollback()

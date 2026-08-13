@@ -1,6 +1,7 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -88,10 +89,38 @@ def _persist_user_selected_candidate(
     flag_modified(temp, "mapping")
 
 
+def _confirmed_counts_by_ids(
+    db: Session, mapping_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, tuple[int, int]]:
+    """Batch (confirmed fields, key fields) for many mapping runs in one query."""
+    if not mapping_ids:
+        return {}
+    rows = (
+        db.query(
+            FinalMapping.mapping_id,
+            func.count(FinalMapping.id),
+            func.coalesce(func.sum(case((FinalMapping.key.is_(True), 1), else_=0)), 0),
+        )
+        .filter(FinalMapping.mapping_id.in_(mapping_ids))
+        .group_by(FinalMapping.mapping_id)
+        .all()
+    )
+    return {
+        mapping_id: (int(confirmed), int(key_count))
+        for mapping_id, confirmed, key_count in rows
+    }
+
+
 def confirmed_counts(db: Session, mapping_id: uuid.UUID) -> tuple[int, int]:
     """(confirmed fields, key fields) — key fields form the comparison business key."""
-    flags = [row for (row,) in db.query(FinalMapping.key).filter_by(mapping_id=mapping_id).all()]
-    return len(flags), sum(1 for is_key in flags if is_key)
+    return _confirmed_counts_by_ids(db, [mapping_id]).get(mapping_id, (0, 0))
+
+
+def _public_status(status: str, confirmed_field_count: int) -> str:
+    """Older runs were stored as completed before approval existed."""
+    if status == "completed" and confirmed_field_count == 0:
+        return "awaiting_approval"
+    return status
 
 
 def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_field: dict | None = None) -> dict:
@@ -119,7 +148,7 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_fiel
     return {
         "mappingRunId": str(mapping.id),
         "mappingName": mapping.mapping_name,
-        "status": mapping.status,
+        "status": _public_status(mapping.status, len(confirmed_by_field)),
         "numberRangeType": mapping.number_range_type,
         "sourceFilename": mapping.source_filename,
         "targetFilename": mapping.target_filename,
@@ -156,14 +185,15 @@ def list_mapping_runs(
         query = query.filter(Mapping.project_id == project_id)
 
     rows = query.order_by(Mapping.created_at.desc()).offset(offset).limit(limit).all()
+    counts_by_id = _confirmed_counts_by_ids(db, [run.id for run, _ in rows])
 
     result = []
     for run, project in rows:
-        confirmed_field_count, key_field_count = confirmed_counts(db, run.id)
+        confirmed_field_count, key_field_count = counts_by_id.get(run.id, (0, 0))
         result.append({
             "mappingRunId": str(run.id),
             "mappingName": run.mapping_name,
-            "status": run.status,
+            "status": _public_status(run.status, confirmed_field_count),
             "projectId": str(project.id),
             "projectName": project.name,
             "sourceFilename": run.source_filename,
@@ -175,6 +205,49 @@ def list_mapping_runs(
             "createdAt": run.created_at.isoformat() if run.created_at else None,
         })
     return result
+
+
+@router.get("/stats")
+def mapping_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lightweight status counts for the dashboard Mapping Approval KPI."""
+    rows = (
+        db.query(Mapping.id, Mapping.status)
+        .join(ValidationProject, Mapping.project_id == ValidationProject.id)
+        .filter(ValidationProject.user_id == current_user.id)
+        .all()
+    )
+    confirmed_ids: set[uuid.UUID] = set()
+    if rows:
+        confirmed_ids = {
+            mapping_id
+            for (mapping_id,) in db.query(FinalMapping.mapping_id)
+            .filter(FinalMapping.mapping_id.in_([row.id for row in rows]))
+            .distinct()
+            .all()
+        }
+
+    approved = awaiting_approval = processing = failed = 0
+    for mapping_id, status in rows:
+        public = _public_status(status, 1 if mapping_id in confirmed_ids else 0)
+        if public == "completed":
+            approved += 1
+        elif public == "awaiting_approval":
+            awaiting_approval += 1
+        elif public == "failed":
+            failed += 1
+        else:
+            processing += 1
+
+    return {
+        "approved": approved,
+        "awaitingApproval": awaiting_approval,
+        "processing": processing,
+        "failed": failed,
+        "total": len(rows),
+    }
 
 
 @router.post("/")
@@ -332,6 +405,7 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
             db.add(existing)
         confirmed.append(existing)
 
+    mapping.status = "completed"
     db.commit()
     return {
         "mappingRunId": str(mapping.id),

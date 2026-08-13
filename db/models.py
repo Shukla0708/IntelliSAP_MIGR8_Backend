@@ -112,7 +112,7 @@ class Mapping(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id = Column(UUID(as_uuid=True), ForeignKey("validation_projects.id", ondelete="CASCADE"), nullable=False)
     mapping_name = Column(String, default="New field mapping run")
-    status = Column(String, default="processing")  # processing | completed | failed
+    status = Column(String, default="processing")  # processing | awaiting_approval | completed | failed
     number_range_type = Column(String)  # internal | external
 
     source_filename = Column(String)
