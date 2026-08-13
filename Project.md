@@ -83,8 +83,8 @@ IntelliSAP_MIGR8_Backend/
     ├── rules_engine.py
     ├── regex_generator.py
     ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
-    ├── embedding_service.py # local TF-IDF vectorizer (mapping)
-    ├── mapping_engine.py    # cosine top-3 + datatype match score (mapping)
+    ├── embedding_service.py # Cohere Embed v4 on Bedrock (TF-IDF fallback)
+    ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
     ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
     └── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
 ```
@@ -105,12 +105,12 @@ Copy `.env.example` → `.env`:
 | `AWS_SECRET_ACCESS_KEY` | optional | Same |
 | `AWS_REGION` | no | Default `ap-south-1` in code — **S3 / RDS region** (e.g. `ap-southeast-2`) |
 | `S3_BUCKET` | no | Default `migr8-ai-validation` |
-| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` |
-| `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — local download URLs |
-| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` |
-| `BEDROCK_REGION` | no | Default `us-east-1` — **Bedrock endpoint only** (`us.*` profiles require this) |
-| `BEDROCK_ACCESS_KEY` | optional | Bedrock console API key (`ABSK…`); uses REST + bearer when set |
-| `CORS_ORIGINS` | no | Comma-separated frontend origins |
+| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` — use `s3` on EC2 |
+| `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
+| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` — regex + mapping LLM |
+| `BEDROCK_EMBED_MODEL_ID` | no | Default `cohere.embed-v4:0` — field-mapping embeddings |
+| `EMBEDDING_BACKEND` | no | `auto` (Cohere if Bedrock creds) \| `bedrock` \| `local` |
+| `CORS_ORIGINS` | no | Comma-separated frontend origins (add EC2 URL on deploy) |
 
 **Important:** `AWS_REGION` and `BEDROCK_REGION` are intentionally separate. S3/RDS can live in `ap-southeast-2` while Bedrock inference profiles like `us.anthropic.claude-sonnet-5` must be called via `us-east-1`.
 
@@ -267,13 +267,23 @@ Bedrock Claude Sonnet 5 via `bedrock_llm.chat()` → JSON `{"regex":"..."}`. Str
 
 ### Mapping services
 
-| Service | Role |
-| --- | --- |
-| `file_parser` | Parse source/target CSV/XLSX with header aliases |
-| `embedding_service` | Local character-trigram + word-bigram TF-IDF (`embed_texts`) |
-| `mapping_engine` | Cosine top-3 candidates + `datatype_match_score` |
-| `llm_mapping` | Bedrock re-rank with confidence + reasoning; embedding fallback on LLM failure |
-| `datatype_matcher` | Hardcoded SAP-type compatibility matrix (100 / 60 / 0) |
+`parse_source_fields` / `parse_target_fields` — read `.csv` or `.xlsx`, match fixed headers case-insensitively (with a small alias list per column), return one dict per row. Raises `ValueError` (→ HTTP 422) if a required column isn't found or the file has no data rows. Source rows: `field_name`, `description`, `key_field` (bool, normalized from `Y/N`/`X`/`TRUE/FALSE`/`1/0`/`yes/no`), `datatype`. Target rows: `sap_table`, `sap_field`, `description`, `table_description`, `datatype`.
+
+### `embedding_service` (mapping)
+
+`embed_texts(list[str]) -> np.ndarray` — **Cohere Embed v4** on Bedrock (`BEDROCK_EMBED_MODEL_ID`, default `cohere.embed-v4:0`) via InvokeModel, same creds as Claude (`BEDROCK_ACCESS_KEY` or IAM). Batches of 96. L2-normalized rows. Falls back to local TF-IDF when `EMBEDDING_BACKEND=local` or no Bedrock credentials.
+
+### `mapping_engine` (mapping)
+
+`top_candidates` — embeds `"{field}: {description}"` for source rows and `"{table}.{field}: {description}"` for target rows, cosine-similarity matrix, returns the top 3 target candidates per source field with a raw `embedding_score` (-1..1) and a `datatype_match_score` (0-100, or `None` if either side's datatype is missing) from `datatype_matcher`.
+
+### `llm_mapping` (mapping)
+
+`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to **Bedrock** (`BEDROCK_MODEL_ID`, default Claude Sonnet 5), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run.
+
+### `datatype_matcher` (mapping)
+
+`datatype_match_score(source_datatype, target_datatype) -> float | None` — hardcoded SAP-type compatibility groups (e.g. `CHAR`/`STRING`/`TEXT`, `NUMC`/`INT`/`NUMBER`, `DATS`/`DATE`, `CURR`/`DEC`/`FLOAT`, `FLAG`/`BOOLEAN`). Exact match after normalization → 100, same group → 60, otherwise → 0. Returns `None` if either datatype is missing.
 
 ---
 
