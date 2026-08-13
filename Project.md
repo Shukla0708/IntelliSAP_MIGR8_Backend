@@ -44,8 +44,10 @@ IntelliSAP_MIGR8_Backend/
 ├── config.py               # Settings from .env (incl. bedrock_region, cors_origins)
 ├── auth.py                 # hash/verify password, JWT, get_current_user
 ├── schema.sql              # Canonical Postgres DDL (preferred over auto-create)
-├── migrations/
-│   └── 001_validation_run_names.sql
+├── migrations/             # Incremental SQL (apply after schema exists)
+│   ├── 001_validation_run_names.sql
+│   ├── 002_field_mapping_key_and_number_range.sql  # number range + key flags
+│   └── 003_comparison_runs.sql  # comparison tables + key index
 ├── requirements.txt
 ├── .env.example
 ├── Project.md              # This file
@@ -62,19 +64,21 @@ IntelliSAP_MIGR8_Backend/
 │   └── test_project_report.py     # GET /api/projects/{id}/report
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
-│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, …
+│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping, ComparisonRun, ComparisonDiscrepancy
 ├── schemas/
 │   ├── __init__.py         # Re-exports for `from schemas import ...`
 │   ├── auth.py
 │   ├── projects.py
 │   ├── validation.py
+│   ├── comparison.py       # Create/Execute requests + review response (comparison)
 │   ├── reports.py
-│   └── mapping.py
+│   └── mapping.py          # ConfirmMappingRequest / ConfirmedFieldIn (mapping)
 ├── routers/
 │   ├── auth.py             # /api/auth/*
 │   ├── projects.py         # /api/projects/*
 │   ├── validation.py       # /api/runs/*
 │   ├── mapping.py          # /api/mappings/*
+│   ├── comparison.py       # /api/comparisons/*
 │   └── chat.py             # /api/chat — grounded results assistant
 └── services/
     ├── aws_client.py        # boto3 clients (S3 uses AWS_REGION; Bedrock uses BEDROCK_REGION)
@@ -88,6 +92,8 @@ IntelliSAP_MIGR8_Backend/
     ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
     ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
     ├── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
+    ├── comparison_file_service.py  # streaming xlsx read/write for comparison
+    ├── comparison_engine.py        # composite-key join, compare, top-50 (comparison)
     └── chat_service.py      # Context packer + Claude Q&A (no SQL from the model)
 ```
 
@@ -129,8 +135,10 @@ users 1──* validation_projects 1──* validation_runs
                                       ├──* validation_fields
                                       └──* validation_exceptions
                                  1──* mappings
-                                      ├──* mapping_temp
-                                      └──* final_mapping
+                                 |    ├──* mapping_temp
+                                 |    └──* final_mapping
+                                 └──* comparison_runs
+                                      └──* comparison_discrepancies
 ```
 
 | Table | Role |
@@ -139,14 +147,16 @@ users 1──* validation_projects 1──* validation_runs
 | `validation_projects` | Scopes runs per user |
 | `validation_runs` | One upload → configure → execute cycle + aggregate stats; **`name` VARCHAR(120) NOT NULL**, unique per `(project_id, name)` |
 | `validation_fields` | Per-column rule flags/config for a run |
-| `validation_exceptions` | Capped failure samples for results UI |
-| `mappings` | Source+target upload → embed → LLM-rank cycle |
-| `mapping_temp` | Top-3 SAP candidates per source field (JSONB) |
-| `final_mapping` | User-confirmed mappings; `(mapping_id, source_field)` unique |
+| `validation_exceptions` | Capped failure samples (~60) for results UI |
+| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping"; `number_range_type` is `internal` \| `external`, chosen at that point |
+| `mapping_temp` | One row per source field; `key_field` mirrors the key flag in the uploaded source file; `mapping` JSONB holds its top-3 SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
+| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row. `key` is copied from `mapping_temp.key_field` and marks a field as part of the comparison business key; several rows may set it |
+| `comparison_runs` | One preload+postload upload → execute cycle plus the stats the review page shows; `name` unique per `(project_id, name)`; `mapping_id` NULL means same-name column matching |
+| `comparison_discrepancies` | Up to 50 rows per comparison run, the worst ones by severity then row number |
 
 **Run status:** `draft` → `rules_configured` → `running` → `completed` \| `failed`
-
-**Mapping status:** `processing` → `completed` \| `failed`
+**Comparison status:** `draft` → `running` → `completed` \| `failed`
+**Mapping status:** `processing` → `completed` \| `failed` (pipeline-only; confirmation is tracked separately by the presence of `final_mapping` rows, not a status value)
 
 **Run names:** User-provided at create (trimmed, non-empty, ≤120 chars). Duplicate within project → HTTP 409.
 
@@ -154,12 +164,29 @@ users 1──* validation_projects 1──* validation_runs
 
 - Source: `validations/{run_id}/source/{filename}`
 - Result: `validations/{run_id}/result/{filename}`
+- Comparison: `comparisons/{run_id}/preload/{filename}`, `.../postload/{filename}`, `.../result/comparison_{filename}`
 
 Prefer applying `schema.sql` in pgAdmin/`psql`. On startup, `Base.metadata.create_all` also creates missing tables (hackathon shortcut).
 
 ```bash
 psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql   # existing DBs with run_name
 ```
+
+That migration renames `run_name` → `name`, backfills duplicate `"New validation run"` rows to unique names, drops the default, and adds `UNIQUE (project_id, name)`.
+
+The field-mapping key flags and number range come next (or run `python scripts/apply_002_field_mapping_migration.py`):
+
+```bash
+psql "$DATABASE_URL" -f migrations/002_field_mapping_key_and_number_range.sql
+```
+
+Then the comparison module (or run `python scripts/apply_comparison_migration.py`):
+
+```bash
+psql "$DATABASE_URL" -f migrations/003_comparison_runs.sql
+```
+
+003 creates `comparison_runs` + `comparison_discrepancies` and indexes `final_mapping.key`. Startup auto-create makes the two new tables but cannot add columns to an existing `final_mapping`/`mapping_temp`, so 002 is required on any database that already had mappings — run it before 003.
 
 ---
 
@@ -194,10 +221,11 @@ psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql   # existing DBs
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| GET | `/?project_id=` | Bearer | List mapping runs for a project (`limit`/`offset` optional). Returns `[{ mappingRunId, mappingName, status, sourceFilename, targetFilename, totalSourceFields, mappedFields, createdAt }]` |
+| GET | `/` | Bearer | Mapping runs owned by the caller, newest first; optional `project_id`, `limit`, `offset`. Returns `[{ mappingRunId, mappingName, status, sourceFilename, targetFilename, totalSourceFields, mappedFields, confirmedFieldCount, keyFieldCount, createdAt, projectId, projectName }]` — the comparison setup screen filters on the two counts |
 | POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` (xlsx/csv) + Form field **`number_range_type`** (`"internal"` \| `"external"`, required — 422 if missing/invalid). Creates the `mappings` row immediately ("Start Mapping"), then runs the pipeline synchronously (upload → parse → embed → top-3 → LLM re-rank → persist to `mapping_temp`) → mapping result JSON |
 | GET | `/{run_id}/result` | Bearer | Re-fetch the same result JSON from `mapping_temp`; each row also carries `confirmedTargetField` (looked up from `final_mapping`, `null` if not yet confirmed) |
-| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"source_field", "target_field"}]}` (snake_case on the wire — see schemas below); validates each `target_field` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`), carrying over `mapping_temp.key_field` into `final_mapping.key` |
+| GET | `/{run_id}/confirmed` | Bearer | Confirmed `final_mapping` rows: `{ sourceField, targetField, isKey }` ordered by source field |
+| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"source_field", "target_field"}]}` (snake_case on the wire — see schemas below); validates each `target_field` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`), carrying over `mapping_temp.key_field` into `final_mapping.key`. Several rows may carry `key` — together they form the composite comparison key |
 
 **Source file** must have a Field Name column, a Description column, a **Key Field flag** column, and a **Datatype** column. **Target file** must have SAP Table, SAP Field, Description, **Table Description**, and **Datatype** columns (case-insensitive, some header aliases accepted — see `file_parser.py`). Key Field flag accepts `Y/N`, `X`, `TRUE/FALSE`, `1/0`, `yes/no` (case-insensitive), normalized to boolean.
 
@@ -254,6 +282,37 @@ Ownership: every run/project access checks the JWT user owns the project.
 | POST | `/{run_id}/execute` | Bearer | Sync validation; updates stats + exceptions |
 | GET | `/{run_id}/result` | Bearer | Payload for results page |
 | GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET (or local URL) |
+
+### Comparison runs — `/api/comparisons`
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| GET | `/` | Bearer | Cross-project list; optional `project_id`, `limit`, `offset`; items carry `records`, `mismatches`, `projectId`, `projectName` |
+| POST | `/?project_id=` | Bearer | Body `{ name }` → `{ run_id }`; duplicate name in project → **409** |
+| POST | `/{run_id}/upload` | Bearer | Multipart `preload_file` + `postload_file`, **.xlsx only** (anything else → 400). Returns both header rows. Files over 200,000 rows → 400 |
+| GET | `/{run_id}/available-mappings` | Bearer | Completed mappings in the same project that have confirmed fields, with `confirmedFieldCount` + `keyFieldCount` |
+| POST | `/{run_id}/execute` | Bearer | Body `{ mapping_id?, business_key_columns_preload?, business_key_columns_postload? }`; runs the comparison synchronously and stores stats, up to 50 discrepancies, and the annotated report |
+| GET | `/{run_id}/result` | Bearer | Review payload (camelCase) for the reconciliation page |
+| GET | `/{run_id}/download-url` | Bearer | `{ url }` for the annotated preload report |
+
+**Column matching.** With a `mapping_id`, `final_mapping` decides everything: each row's `source_field` is a preload column and its `target_field` (`"{sap_table}.{sap_field}"`) resolves to a postload column by full dotted name or by the SAP field suffix. Without one, every column whose name appears in both files is compared.
+
+**Row matching.** With a mapping, all `final_mapping.key` rows form the composite business key (at least one is required, otherwise 422). Without one, `business_key_columns_preload`/`_postload` give an explicit composite key; if omitted, the first shared column is used. Key columns are excluded from value comparison. A preload row with no postload match is a `DROPPED_RECORD`; a postload-only row is an `EXTRA_RECORD`; both count toward `missingCount`.
+
+**Value equivalence** (`values_equivalent` in `comparison_engine`). A load rewrites how values are spelled, so these are treated as equal and never reported:
+
+| Preload | Postload | Rule |
+| --- | --- | --- |
+| `100045` | `0000100045` / `'0000100045` | Leading zeros on numbers (SAP ALPHA conversion); an Excel apostrophe that forces the cell to stay text |
+| `1000` | `1,000.00` / `1 000` / `1.000,00` / `$1,000.00` | Decimal noise, grouping separators, and a currency symbol; with both `,` and `.` the rightmost is the decimal point |
+| `-100` | `100-` / `(100)` / `−100` | Sign written in front, trailing (SAP), as accounting parentheses, or as a unicode minus |
+| `2024-01-05` | `05.01.2024` / `2024-01-05 00:00:00` | Date/datetime format, and a midnight time component |
+
+Everything else still surfaces: `1000` vs `1000.01`, a value against a blank (blank is not zero), and `1E5` vs `100000` (exponent notation stays text) are `VALUE_MISMATCH`; case/punctuation-only text differences remain `FORMAT_CHANGE` at `info`. Zero padding is ignored on the **business key** too (`canonical_key_part`) — otherwise a preload `100045` never meets a postload `0000100045` and both rows report as missing. Keys use the numeric rule only, so an ambiguous date can't silently join two rows.
+
+Two consequences worth knowing: a genuinely zero-significant text code (postal code `01234` vs `1234`) counts as equal because the column is numeric, and slash dates are matched under any reading that parses (`05/01/2024` matches both January 5 and May 1).
+
+Ownership: every comparison access checks the JWT user owns the project.
 
 ---
 
@@ -330,6 +389,16 @@ Grounded Q&A for dashboard / validation / mapping results. **Claude does not wri
 
 `datatype_match_score(source_datatype, target_datatype) -> float | None` — hardcoded SAP-type compatibility groups (e.g. `CHAR`/`STRING`/`TEXT`, `NUMC`/`INT`/`NUMBER`, `DATS`/`DATE`, `CURR`/`DEC`/`FLOAT`, `FLAG`/`BOOLEAN`). Exact match after normalization → 100, same group → 60, otherwise → 0. Returns `None` if either datatype is missing.
 
+### `comparison_file_service` (comparison)
+
+`read_header` / `count_data_rows` / `iter_data_rows` read with openpyxl `read_only=True` so a 200k-row workbook never lands in memory as objects. `AnnotatedResultWriter` streams the report with xlsxwriter in `constant_memory` mode: preload columns in their original order, red fill (`#FFC7CE`, the same red the validation report uses) on every failing cell, and an appended `Comparison_Failure_Detail` column. Cells are written with typed calls (`write_string`, `write_number`, `write_datetime`) because xlsxwriter's generic `write()` runs token detection per cell, which dominates the runtime at this scale.
+
+### `comparison_engine` (comparison)
+
+`build_plan` resolves which columns join the two files and which are compared, from `final_mapping` or from shared column names. `run_comparison` then indexes the postload file by composite key and streams the preload file once — comparing, counting, keeping the worst 50 discrepancies in a bounded heap, and writing the report in the same pass. Values are normalized before comparison (trimmed, integral floats as integers, dates as ISO); differing values that match after dropping case and punctuation are reported as `FORMAT_CHANGE` (info) rather than `VALUE_MISMATCH` (warning). Duplicate business keys in the postload file resolve last-wins.
+
+Measured on 2 × 200,000 rows × 10 columns: ~78s and ~200 MB peak heap, so `execute` stays synchronous.
+
 ---
 
 ## Pydantic schemas (`schemas/`)
@@ -340,7 +409,8 @@ Grounded Q&A for dashboard / validation / mapping results. **Claude does not wri
 | `projects.py` | `ProjectCreate`, `ProjectOut` — `id` serialized as `str` |
 | `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, … |
 | `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest/Response`, `RunDetailOut`, `RunFieldOut` |
-| `mapping.py` | `ConfirmedFieldIn`, `ConfirmMappingRequest` |
+| `mapping.py` | `ConfirmedFieldIn` (`source_field`, `target_field`), `ConfirmMappingRequest` (`fields: list[ConfirmedFieldIn]`) — body for `POST /{run_id}/confirm` |
+| `comparison.py` | `CreateComparisonRequest`, `ExecuteComparisonRequest`, `ComparisonReviewOut`, `ComparisonDiscrepancyOut` — review models are camelCase to match the reconciliation page |
 | `chat.py` | `ChatRequest`, `ChatResponse`, `ChatContextIn`, `ChatTurn` |
 
 Routers import via `from schemas import ...`.
@@ -368,6 +438,10 @@ uvicorn main:app --reload --port 8000
 # Existing DB missing number-range/key-field columns for field mapping:
 # psql "$DATABASE_URL" -f migrations/002_field_mapping_key_and_number_range.sql
 # (or: python scripts/apply_002_field_mapping_migration.py)
+
+# Comparison tables (run after 002):
+# psql "$DATABASE_URL" -f migrations/003_comparison_runs.sql
+# (or: python scripts/apply_comparison_migration.py)
 ```
 
 Smoke checks:
@@ -382,7 +456,8 @@ python scripts/test_regex_bedrock.py   # needs BEDROCK_ACCESS_KEY or IAM Bedrock
 Tests (needs Postgres + `.env`):
 
 ```bash
-pytest tests/ -q
+pytest tests/ -q      # scope to tests/; scripts/test_*.py are manual Bedrock probes
+pytest tests/test_comparison.py -q
 ```
 
 ---
@@ -403,6 +478,9 @@ pytest tests/ -q
 12. **Exception cap** — diverse error types in UI despite many failures in the file.
 13. **Bedrock API key vs IAM** — API key uses httpx REST; IAM uses boto3. S3 always uses IAM keys/role.
 14. **Mapping confirmation is per-field** — upsert on `(mapping_id, source_field)`.
+15. **Storage is shared and backend-agnostic** — every module (validation and comparison) writes through `services/s3_service`, so `STORAGE_BACKEND=auto` puts files in S3 whenever credentials resolve and only falls back to `local_storage/` when they don't.
+16. **Comparison is xlsx in, xlsx out** — no CSV path anywhere, capped at 200,000 rows per file, so reads and writes can both stream and the report keeps Excel formatting (red cells).
+17. **The comparison business key is composite by design** — `final_mapping.key` is a plain boolean with no uniqueness constraint, and every flagged field contributes one part of the join key.
 
 ---
 
@@ -416,15 +494,23 @@ pytest tests/ -q
 - Field mapping: batch multiple source fields per LLM call (or queue+poll) instead of one call each, once field-list sizes grow
 - Field mapping: "Fetch from SAP" live target-table lookup isn't implemented — target field list is upload-only for now
 - Field mapping: `datatype_match_score` uses a hardcoded compatibility matrix (`services/datatype_matcher.py`); revisit if SAP type coverage needs to grow
-- Field mapping: `GET /{run_id}/result` now surfaces `confirmedTargetField` per row (read-only), but there's still no endpoint to un-confirm/delete a single `final_mapping` row — only upsert via `/confirm`
+- Field mapping: `GET /{run_id}/result` now surfaces `confirmedTargetField` per row and `GET /{run_id}/confirmed` reads confirmed rows, but there's still no endpoint to un-confirm/delete a single `final_mapping` row — only upsert via `/confirm`
 - Remove unused `groq` / `passlib` from `requirements.txt` once venv is rebuilt
 - Field mapping: batch multiple source fields per LLM call for large files
-- Field mapping: list/edit confirmed `final_mapping` rows endpoint
 - Drop debug `print` in `rules_engine.validate_cell` before production
+- Comparison: `execute` is synchronous (~78s at the 200k-row cap); move to a queue + poll if files grow past that
+- Comparison keys ride on the source file's Key Field flag, so a preload/postload pair can only use a mapping whose source schema had keys flagged
 
 ---
 
 ## Session Log
+
+### 2026-08-14 — Comparison ignores re-spelled values
+
+- `comparison_engine.values_equivalent` treats a value as unchanged when only its spelling moved: zero padding from ALPHA conversion, decimal/grouping noise, a leading, trailing or parenthesised sign, and date/datetime format (see the equivalence table in the API map). Such cells produce no discrepancy, no red fill, and count toward `matchedRecords`.
+- `canonical_key_part` applies the zero-padding rule to the business key as well, so a preload `100045` joins a postload `0000100045` instead of both rows reporting as missing. Keys deliberately use the numeric rule only.
+- Numbers are parsed with `Decimal` (never float) so 18-digit SAP keys compare exactly; exponent notation is excluded so ids like `1E5` stay text. Both parsers sit behind cheap character-set/regex gates, and `classify_difference` only reaches them once a cell has already failed exact string equality, so the 200k-row path is unaffected.
+- Three tests added in `tests/test_comparison.py` (padded keys + values, reformatted numbers/dates/signs, and a guard that `1000` vs `1000.01` and `0` vs blank still fail).
 
 ### 2026-08-13 — Results chatbot (grounded Q&A)
 
@@ -433,12 +519,28 @@ pytest tests/ -q
 - `GET /api/mappings/` lists runs across projects (optional `project_id`).
 - Tests: `tests/test_chat.py`.
 
+### 2026-08-13 — Comparison merged onto the shared key-field column
+
+- Resolved the overlap between the comparison feature and the number-range work: the comparison business key now reads `final_mapping.key` (set from the source file's Key Field flag on confirm) instead of the parallel `is_key` boolean the comparison branch had added. `ConfirmedFieldIn` no longer takes a key flag — nothing outside the mapping pipeline decides which fields are keys.
+- The comparison migration became `003_comparison_runs.sql` (the comparison branch had also numbered its file 002) and now only adds the two tables plus a partial index on `final_mapping(mapping_id) WHERE key`; `scripts/apply_comparison_migration.py` refuses to run until 002 has added the column.
+- Both branches had added `GET /api/mappings/`; they are now one endpoint that keeps the `mappingRunId`/`mappingName` response keys and adds `confirmedFieldCount`, `keyFieldCount`, `projectId`, `projectName`. `project_id` is optional so the cross-project activity list can reuse it.
+- `schema.sql` picked up the three columns 002 adds (`mappings.number_range_type`, `mapping_temp.key_field`, `final_mapping.key`), which the migration had introduced without updating the canonical DDL.
+- Comparison files verified landing in S3 (`comparisons/{run_id}/{preload,postload,result}/`) — no comparison-specific storage code, it goes through `services/s3_service` exactly like validation.
+
 ### 2026-08-13 — Number-range/key-field mapping + confirmation status catch-up
 
 - Documents a feature that had already landed in code but was never written up here: `POST /api/mappings/?project_id=` now requires a `number_range_type` Form field (`internal`\|`external`); `mapping_temp.key_field`/`final_mapping.key` track which source fields are key fields (`migrations/002_field_mapping_key_and_number_range.sql`).
 - For key fields under an `internal` number range, `mapping_engine`'s pipeline is bypassed for that row — `routers/mapping.py`'s `create_mapping_run` hands back the full target catalog as `prospects` (datatype match score only, no embedding/LLM confidence) so the frontend can present a manual picker instead of an AI suggestion.
 - `GET /{run_id}/result` (`_serialize` in `routers/mapping.py`) now also joins `final_mapping` and adds `confirmedTargetField` per row (`null` if that source field hasn't been confirmed yet), so reopening a run can show which fields are already approved.
 - No breaking change to `POST /{run_id}/confirm`'s contract — it now also copies `mapping_temp.key_field` into `final_mapping.key` on upsert.
+
+### 2026-08-13 — Preload vs postload comparison
+
+- New tables `comparison_runs` + `comparison_discrepancies`, joined on the composite business key a mapping declares (`migrations/003_comparison_runs.sql`, applied by `scripts/apply_comparison_migration.py`).
+- New router `routers/comparison.py` (`/api/comparisons`): create, xlsx-only paired upload, available mappings, synchronous execute, review payload, download URL.
+- New services `comparison_file_service` (openpyxl `read_only` reads, xlsxwriter `constant_memory` annotated report) and `comparison_engine` (composite-key join, value comparison, bounded top-50 discrepancies).
+- `/api/mappings/` list and `/api/mappings/{id}/confirmed` added.
+- Added `XlsxWriter==3.2.9` to `requirements.txt` and `tests/test_comparison.py` (14 tests covering both mapping modes, composite keys, discrepancy types, the 50 cap, the report layout, and ownership).
 
 ### 2026-08-13 — Field mapping feature (source → SAP target)
 ### 2026-08-13 — Bedrock region + API key + Sonnet 5 response parsing

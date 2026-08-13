@@ -147,4 +147,57 @@ class FinalMapping(Base):
 
     source_field = Column(String, nullable=False)
     target_field = Column(String, nullable=False)  # "{sap_table}.{sap_field}"
+    # Carried over from mapping_temp.key_field on confirm. Several fields may be
+    # flagged; together they form the composite business key used to join preload
+    # and postload rows during comparison.
     key = Column(Boolean, default=False)
+
+
+class ComparisonRun(Base):
+    __tablename__ = "comparison_runs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_comparison_runs_project_name"),
+    )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("validation_projects.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(120), nullable=False)
+    status = Column(String, default="draft")  # draft | running | completed | failed
+
+    mapping_id = Column(UUID(as_uuid=True), ForeignKey("mappings.id", ondelete="SET NULL"))
+    business_key_columns_preload = Column(JSONB, default=list)
+    business_key_columns_postload = Column(JSONB, default=list)
+
+    preload_filename = Column(String)
+    preload_s3_key = Column(String)
+    postload_filename = Column(String)
+    postload_s3_key = Column(String)
+    result_s3_key = Column(String)
+
+    total_preload_rows = Column(Integer, default=0)
+    total_postload_rows = Column(Integer, default=0)
+    matched_records = Column(Integer, default=0)
+    different_count = Column(Integer, default=0)
+    missing_count = Column(Integer, default=0)
+    match_rate = Column(Numeric(5, 2), default=0)
+
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    ran_at = Column(TIMESTAMP(timezone=True))
+    completed_at = Column(TIMESTAMP(timezone=True))
+
+    discrepancies = relationship("ComparisonDiscrepancy", cascade="all, delete-orphan")
+
+
+class ComparisonDiscrepancy(Base):
+    __tablename__ = "comparison_discrepancies"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id = Column(UUID(as_uuid=True), ForeignKey("comparison_runs.id", ondelete="CASCADE"))
+    row_number = Column(Integer, nullable=False)
+    business_key = Column(Text, nullable=False)
+    field_name = Column(String, nullable=False)
+    field_italic = Column(Boolean, nullable=False, default=False)
+    preload_value = Column(Text)
+    postload_value = Column(Text)
+    difference_type = Column(String, nullable=False)
+    severity = Column(String, default="warning")  # error | warning | info
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
