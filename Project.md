@@ -74,7 +74,8 @@ IntelliSAP_MIGR8_Backend/
 │   ├── auth.py             # /api/auth/*
 │   ├── projects.py         # /api/projects/*
 │   ├── validation.py       # /api/runs/*
-│   └── mapping.py          # /api/mappings/*
+│   ├── mapping.py          # /api/mappings/*
+│   └── chat.py             # /api/chat — grounded results assistant
 └── services/
     ├── aws_client.py        # boto3 clients (S3 uses AWS_REGION; Bedrock uses BEDROCK_REGION)
     ├── bedrock_llm.py       # Bedrock Converse wrapper (boto3 or REST bearer)
@@ -86,7 +87,8 @@ IntelliSAP_MIGR8_Backend/
     ├── embedding_service.py # Cohere Embed v4 on Bedrock (TF-IDF fallback)
     ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
     ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
-    └── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
+    ├── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
+    └── chat_service.py      # Context packer + Claude Q&A (no SQL from the model)
 ```
 
 ---
@@ -225,8 +227,15 @@ psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql   # existing DBs
 }
 ```
 | POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` → pipeline → `mapping_temp` |
-| GET | `/{run_id}/result` | Bearer | Re-fetch mapping result JSON |
+| GET | `/` | Bearer | Optional `project_id`; list mapping runs for the current user |
+| GET | `/{run_id}/result` | Bearer | Re-fetch mapping result JSON (includes `confirmedTargetField`) |
 | POST | `/{run_id}/confirm` | Bearer | Body `{ fields: [{ sourceField, targetField }] }` → upsert `final_mapping` |
+
+### Chat — `/api/chat`
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| POST | `/` | Bearer | Body `{ message, history?, context: { page, project_id?, run_id?, mapping_id? } }` → `{ reply, refused, page }`. Backend packs owned results; Claude answers from that JSON only. Off-topic questions are refused without a model call. |
 
 **Source file** columns: Field Name, Description, Key Field flag, Datatype. **Target file**: SAP Table, SAP Field, Description, Table Description, Datatype (aliases in `file_parser.py`).
 
@@ -313,6 +322,10 @@ Bedrock Claude Sonnet 5 via `bedrock_llm.chat()` → JSON `{"regex":"..."}`. Str
 
 `rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to **Bedrock** (`BEDROCK_MODEL_ID`, default Claude Sonnet 5), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run.
 
+### `chat_service`
+
+Grounded Q&A for dashboard / validation / mapping results. **Claude does not write SQL or call APIs.** `chat_service` loads an allow-listed JSON pack (recent runs, latest completed run + exception sample, mapping candidates + confirmed rows) and `bedrock_llm.chat()` explains it. No pgvector. Off-topic / jailbreak prompts return a fixed refusal.
+
 ### `datatype_matcher` (mapping)
 
 `datatype_match_score(source_datatype, target_datatype) -> float | None` — hardcoded SAP-type compatibility groups (e.g. `CHAR`/`STRING`/`TEXT`, `NUMC`/`INT`/`NUMBER`, `DATS`/`DATE`, `CURR`/`DEC`/`FLOAT`, `FLAG`/`BOOLEAN`). Exact match after normalization → 100, same group → 60, otherwise → 0. Returns `None` if either datatype is missing.
@@ -328,6 +341,7 @@ Bedrock Claude Sonnet 5 via `bedrock_llm.chat()` → JSON `{"regex":"..."}`. Str
 | `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, … |
 | `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest/Response`, `RunDetailOut`, `RunFieldOut` |
 | `mapping.py` | `ConfirmedFieldIn`, `ConfirmMappingRequest` |
+| `chat.py` | `ChatRequest`, `ChatResponse`, `ChatContextIn`, `ChatTurn` |
 
 Routers import via `from schemas import ...`.
 
@@ -411,6 +425,13 @@ pytest tests/ -q
 ---
 
 ## Session Log
+
+### 2026-08-13 — Results chatbot (grounded Q&A)
+
+- `POST /api/chat/` packs owned validation/mapping/dashboard JSON; Claude Sonnet 5 answers from that pack only.
+- Claude does not generate SQL or call APIs. Off-topic questions are refused in code.
+- `GET /api/mappings/` lists runs across projects (optional `project_id`).
+- Tests: `tests/test_chat.py`.
 
 ### 2026-08-13 — Number-range/key-field mapping + confirmation status catch-up
 

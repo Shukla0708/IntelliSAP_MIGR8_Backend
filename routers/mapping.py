@@ -61,23 +61,30 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_fiel
 
 @router.get("/")
 def list_mapping_runs(
-    project_id: uuid.UUID,
+    project_id: uuid.UUID | None = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = db.get(ValidationProject, project_id)
-    if not project or project.user_id != current_user.id:
-        raise HTTPException(404, "Project not found")
+    if project_id is not None:
+        project = db.get(ValidationProject, project_id)
+        if not project or project.user_id != current_user.id:
+            raise HTTPException(404, "Project not found")
 
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
+    query = (
+        db.query(Mapping, ValidationProject)
+        .join(ValidationProject, Mapping.project_id == ValidationProject.id)
+        .filter(ValidationProject.user_id == current_user.id)
+    )
+    if project_id is not None:
+        query = query.filter(Mapping.project_id == project_id)
+
     runs = (
-        db.query(Mapping)
-        .filter(Mapping.project_id == project_id)
-        .order_by(Mapping.created_at.desc())
+        query.order_by(Mapping.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -88,13 +95,15 @@ def list_mapping_runs(
             "mappingRunId": str(run.id),
             "mappingName": run.mapping_name,
             "status": run.status,
+            "projectId": str(project.id),
+            "projectName": project.name,
             "sourceFilename": run.source_filename,
             "targetFilename": run.target_filename,
             "totalSourceFields": run.total_source_fields,
             "mappedFields": run.mapped_fields,
             "createdAt": run.created_at.isoformat() if run.created_at else None,
         }
-        for run in runs
+        for run, project in runs
     ]
 
 

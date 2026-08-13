@@ -10,6 +10,7 @@ from schemas.validation import (
     RunFieldOut,
 )
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
+from schemas.chat import ChatRequest, ChatResponse, ChatContextIn, ChatTurn
 
 __all__ = [
     "RegisterRequest",
@@ -27,4 +28,8 @@ __all__ = [
     "RunFieldOut",
     "ConfirmedFieldIn",
     "ConfirmMappingRequest",
+    "ChatRequest",
+    "ChatResponse",
+    "ChatContextIn",
+    "ChatTurn",
 ]
