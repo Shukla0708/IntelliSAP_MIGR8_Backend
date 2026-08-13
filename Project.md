@@ -48,7 +48,7 @@ backend/
 ├── .env.example
 ├── Project.md              # This file
 ├── tests/
-│   └── test_run_names.py   # Create-run naming + uniqueness
+│   └── test_project_report.py # GET /api/projects/{id}/report
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
 │   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception
@@ -56,6 +56,7 @@ backend/
 │   ├── __init__.py         # Re-exports for `from schemas import ...`
 │   ├── auth.py
 │   ├── projects.py
+│   ├── reports.py
 │   └── validation.py
 ├── routers/
 │   ├── auth.py             # /api/auth/*
@@ -145,6 +146,7 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 | POST | `/` | Bearer | `{ name }` → `ProjectOut` |
 | GET | `/` | Bearer | List current user’s projects |
 | GET | `/{project_id}/runs` | Bearer | Runs list shaped for frontend cards (`id`, `name`, `records`, `ranAt`, `status`, `errors`) |
+| GET | `/{project_id}/report` | Bearer | Aggregated validation KPIs for project report screen (`ProjectReportOut`) |
 
 ### Validation runs — `/api/runs`
 
@@ -202,6 +204,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 | --- | --- |
 | `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` — email is plain `str` with simple `@` / domain checks (not strict `EmailStr`) |
 | `projects.py` | `ProjectCreate`, `ProjectOut` — `id` always serialized as `str` (UUID coerced) |
+| `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc. — project report aggregation |
 | `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest`, `RegexGenerateResponse` |
 
 Routers import via `from schemas import ...` (`schemas/__init__.py` re-exports).
@@ -275,6 +278,12 @@ pytest tests/test_run_names.py -q
 
 - Added `GET /api/runs/` (optional `project_id`, `limit`, `offset`) joining runs → owned projects for the current user; response includes `project_id` / `project_name` for Activity UI.
 - Test: `test_list_runs_across_projects` in `tests/test_run_names.py`.
+
+### 2026-08-13 — Project report endpoint
+
+- Added `GET /api/projects/{project_id}/report` — aggregates validation run stats for the frontend `/report` screen.
+- New `schemas/reports.py` with `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc.
+- Tests: `tests/test_project_report.py` (empty report, 404 for non-owner).
 
 ### 2026-08-13 — Logout endpoint
 
