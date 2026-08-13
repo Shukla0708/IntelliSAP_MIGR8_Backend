@@ -12,6 +12,8 @@ DATE_FORMATS = (
     "%d/%m/%Y",
     "%Y-%m-%d %H:%M:%S",  # openpyxl datetime → str(value)
     "%Y-%m-%d %H:%M:%S.%f",
+    "%Y%m%d",
+    "%d%m%y" 
 )
 
 

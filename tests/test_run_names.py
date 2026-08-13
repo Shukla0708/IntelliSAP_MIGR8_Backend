@@ -96,6 +96,41 @@ def test_same_name_different_projects_allowed(client, auth_user):
     assert r1.json()["run_id"] != r2.json()["run_id"]
 
 
+def test_list_runs_across_projects(client, auth_user):
+    headers = auth_user["headers"]
+    p1 = _create_project(client, headers, f"Proj-A-{uuid.uuid4().hex[:8]}")
+    p2 = _create_project(client, headers, f"Proj-B-{uuid.uuid4().hex[:8]}")
+
+    r1 = client.post(
+        f"/api/runs/?project_id={p1}",
+        json={"name": "Cross List A"},
+        headers=headers,
+    )
+    r2 = client.post(
+        f"/api/runs/?project_id={p2}",
+        json={"name": "Cross List B"},
+        headers=headers,
+    )
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+
+    all_runs = client.get("/api/runs/", headers=headers)
+    assert all_runs.status_code == 200, all_runs.text
+    rows = all_runs.json()
+    ids = {row["id"] for row in rows}
+    assert r1.json()["run_id"] in ids
+    assert r2.json()["run_id"] in ids
+    match = next(row for row in rows if row["id"] == r1.json()["run_id"])
+    assert match["project_id"] == p1
+    assert "project_name" in match
+
+    filtered = client.get(f"/api/runs/?project_id={p1}", headers=headers)
+    assert filtered.status_code == 200
+    filtered_ids = {row["id"] for row in filtered.json()}
+    assert r1.json()["run_id"] in filtered_ids
+    assert r2.json()["run_id"] not in filtered_ids
+
+
 def test_empty_name_returns_422(client, auth_user):
     headers = auth_user["headers"]
     project_id = _create_project(client, headers, f"Proj-{uuid.uuid4().hex[:8]}")
@@ -106,3 +141,40 @@ def test_empty_name_returns_422(client, auth_user):
         headers=headers,
     )
     assert res.status_code == 422
+
+
+def test_get_run_detail(client, auth_user):
+    headers = auth_user["headers"]
+    project_id = _create_project(client, headers, f"Proj-{uuid.uuid4().hex[:8]}")
+
+    created = client.post(
+        f"/api/runs/?project_id={project_id}",
+        json={"name": "Detail Run"},
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    run_id = created.json()["run_id"]
+
+    detail = client.get(f"/api/runs/{run_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["id"] == run_id
+    assert body["name"] == "Detail Run"
+    assert body["status"] == "draft"
+    assert body["has_source_file"] is False
+    assert body["fields"] == []
+
+    rules = client.put(
+        f"/api/runs/{run_id}/rules",
+        json=[{
+            "field_name": "CUSTOMER_ID",
+            "flag_key": True,
+            "flag_mandatory": True,
+        }],
+        headers=headers,
+    )
+    assert rules.status_code == 200, rules.text
+
+    listed = client.get(f"/api/projects/{project_id}/runs", headers=headers)
+    match = next(r for r in listed.json() if r["id"] == run_id)
+    assert match["status"] == "rules_configured"

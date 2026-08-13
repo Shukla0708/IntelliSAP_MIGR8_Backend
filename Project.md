@@ -48,7 +48,7 @@ backend/
 ├── .env.example
 ├── Project.md              # This file
 ├── tests/
-│   └── test_run_names.py   # Create-run naming + uniqueness
+│   └── test_project_report.py # GET /api/projects/{id}/report
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
 │   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping
@@ -58,6 +58,8 @@ backend/
 │   ├── projects.py
 │   ├── validation.py
 │   └── mapping.py          # ConfirmMappingRequest / ConfirmedFieldIn (mapping)
+│   ├── reports.py
+│   └── validation.py
 ├── routers/
 │   ├── auth.py             # /api/auth/*
 │   ├── projects.py         # /api/projects/*
@@ -159,6 +161,7 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 | POST | `/` | Bearer | `{ name }` → `ProjectOut` |
 | GET | `/` | Bearer | List current user’s projects |
 | GET | `/{project_id}/runs` | Bearer | Runs list shaped for frontend cards (`id`, `name`, `records`, `ranAt`, `status`, `errors`) |
+| GET | `/{project_id}/report` | Bearer | Aggregated validation KPIs for project report screen (`ProjectReportOut`) |
 
 ### Field mapping — `/api/mappings`
 
@@ -198,7 +201,9 @@ Ownership: every run/project access checks the JWT user owns the project.
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
+| GET | `/` | Bearer | Cross-project list for current user; optional `project_id`, `limit`, `offset`; includes `project_id` + `project_name`; returns real statuses (`draft`, `rules_configured`, etc.) |
 | POST | `/?project_id=` | Bearer | Body `{ name }` (trimmed, required) → `{ run_id }`; duplicate name in project → **409** |
+| GET | `/{run_id}` | Bearer | Run detail for draft edit UI: `name`, `status`, `source_filename`, `has_source_file`, `fields[]` with rule config |
 | POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3; returns `{ fields }` |
 | PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config |
 | POST | `/generate-regex` | Bearer | `{ field_name, prompt }` → `{ regex }` |
@@ -206,7 +211,7 @@ Ownership: every run/project access checks the JWT user owns the project.
 | GET | `/{run_id}/result` | Bearer | Payload for results page (`runName` = stored name) |
 | GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET |
 
-Ownership: every run/project access checks the JWT user owns the project.
+Ownership: every run/project access checks the JWT user owns the project. Cross-project `GET /api/runs/` never returns another user’s runs.
 
 ---
 
@@ -269,6 +274,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 | --- | --- |
 | `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` — email is plain `str` with simple `@` / domain checks (not strict `EmailStr`) |
 | `projects.py` | `ProjectCreate`, `ProjectOut` — `id` always serialized as `str` (UUID coerced) |
+| `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc. — project report aggregation |
 | `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest`, `RegexGenerateResponse` |
 | `mapping.py` | `ConfirmedFieldIn` (`source_field`, `target_field`), `ConfirmMappingRequest` (`fields: list[ConfirmedFieldIn]`) — body for `POST /{run_id}/confirm` |
 
@@ -348,14 +354,27 @@ pytest tests/test_run_names.py -q
 
 ### 2026-08-13 — Field mapping feature (source → SAP target)
 
-- New tables `mappings`, `mapping_temp`, `final_mapping` (models `Mapping`, `MappingTemp`, `FinalMapping`), project-scoped like validation runs. `mappings` row is created immediately when "Start Mapping" is clicked, before the pipeline runs.
 - New router `routers/mapping.py`: `POST /api/mappings/?project_id=` (multipart `source_file` + `target_file`) runs parse → embed → top-3 → LLM re-rank synchronously and persists one `mapping_temp` row per source field (JSONB array of candidates); `GET /{run_id}/result` re-fetches it; `POST /{run_id}/confirm` validates and upserts confirmed picks into `final_mapping`.
 - New services: `file_parser` (adds Key Field flag + Datatype to source uploads, Table Description + Datatype to target uploads), `embedding_service` (local TF-IDF, numpy only), `mapping_engine` (cosine top-3 + datatype match score), `llm_mapping` (Groq re-rank + reasoning), `datatype_matcher` (hardcoded SAP-type compatibility matrix).
 - Response gained `datatypeMatchScore` per candidate and `mappedFields` on the run; `sourceDescription` is intentionally not persisted (dropped from `mapping_temp`'s minimal column set).
 - Added `numpy==1.26.4` to `requirements.txt`.
+### 2026-08-13 — Validation run detail + real list statuses
+
+- List endpoints (`GET /api/runs/`, `GET /api/projects/{id}/runs`) now return real `draft` / `rules_configured` statuses instead of mapping them to `running`.
+- Test: `test_get_run_detail` in `tests/test_run_names.py`.
+
+### 2026-08-13 — Cross-project runs list
+
+- Added `GET /api/runs/` (optional `project_id`, `limit`, `offset`) joining runs → owned projects for the current user; response includes `project_id` / `project_name` for Activity UI.
+- Test: `test_list_runs_across_projects` in `tests/test_run_names.py`.
+
+### 2026-08-13 — Project report endpoint
+
+- Added `GET /api/projects/{project_id}/report` — aggregates validation run stats for the frontend `/report` screen.
+- New `schemas/reports.py` with `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc.
+- Tests: `tests/test_project_report.py` (empty report, 404 for non-owner).
 
 ### 2026-08-13 — Logout endpoint
-
 - Added `POST /api/auth/logout` (Bearer required). Confirms session; client clears JWT (stateless).
 
 ### 2026-08-13 — Frontend consumes JWT (no API change)

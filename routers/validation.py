@@ -8,7 +8,14 @@ from db.database import get_db
 from db.models import User, ValidationRun, ValidationField, ValidationException, ValidationProject
 from auth import get_current_user
 from services import excel_service, s3_service, regex_generator
-from schemas import CreateRunRequest, FieldRuleIn, RegexGenerateRequest, RegexGenerateResponse
+from schemas import (
+    CreateRunRequest,
+    FieldRuleIn,
+    RegexGenerateRequest,
+    RegexGenerateResponse,
+    RunDetailOut,
+    RunFieldOut,
+)
 
 router = APIRouter(prefix="/api/runs", tags=["validation"])
 
@@ -21,6 +28,57 @@ def _get_owned_run(run_id: uuid.UUID, db: Session, current_user: User) -> Valida
     if not project or project.user_id != current_user.id:
         raise HTTPException(404, "Run not found")
     return run
+
+
+_VALID_STATUSES = ("draft", "rules_configured", "running", "completed", "failed")
+
+
+def _list_status(status: str | None) -> str:
+    if status in _VALID_STATUSES:
+        return status
+    return "draft"
+
+
+@router.get("/")
+def list_runs(
+    project_id: uuid.UUID | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List validation runs across all projects owned by the current user."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    query = (
+        db.query(ValidationRun, ValidationProject)
+        .join(ValidationProject, ValidationRun.project_id == ValidationProject.id)
+        .filter(ValidationProject.user_id == current_user.id)
+    )
+    if project_id is not None:
+        query = query.filter(ValidationRun.project_id == project_id)
+
+    rows = (
+        query.order_by(ValidationRun.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "id": str(run.id),
+            "name": run.name,
+            "records": f"{run.total_records} records",
+            "ranAt": run.ran_at.isoformat() if run.ran_at else None,
+            "status": _list_status(run.status),
+            "errors": run.total_errors or 0,
+            "project_id": str(project.id),
+            "project_name": project.name,
+        }
+        for run, project in rows
+    ]
 
 
 @router.post("/")
@@ -50,6 +108,48 @@ def create_run(
         )
     db.refresh(run)
     return {"run_id": str(run.id)}
+
+
+@router.get("/{run_id}", response_model=RunDetailOut)
+def get_run(
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = _get_owned_run(run_id, db, current_user)
+    field_rows = (
+        db.query(ValidationField)
+        .filter_by(run_id=run_id)
+        .order_by(ValidationField.column_index)
+        .all()
+    )
+    return RunDetailOut(
+        id=str(run.id),
+        project_id=str(run.project_id),
+        name=run.name,
+        status=run.status or "draft",
+        source_filename=run.source_filename,
+        has_source_file=bool(run.source_s3_key),
+        fields=[
+            RunFieldOut(
+                field_name=f.field_name,
+                flag_key=f.flag_key or False,
+                flag_mandatory=f.flag_mandatory or False,
+                flag_null=f.flag_null or False,
+                flag_email=f.flag_email or False,
+                flag_mobile=f.flag_mobile or False,
+                flag_date=f.flag_date or False,
+                flag_special_chars=f.flag_special_chars or False,
+                case_format=f.case_format,
+                data_type=f.data_type or "string",
+                max_length=f.max_length,
+                decimal_length=f.decimal_length,
+                regex=f.regex,
+                regex_prompt=f.regex_prompt,
+            )
+            for f in field_rows
+        ],
+    )
 
 
 @router.post("/{run_id}/upload")
