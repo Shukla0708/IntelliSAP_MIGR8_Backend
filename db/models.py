@@ -29,6 +29,7 @@ class ValidationProject(Base):
     user = relationship("User", back_populates="projects")
     runs = relationship("ValidationRun", back_populates="project", cascade="all, delete-orphan")
     mappings = relationship("Mapping", cascade="all, delete-orphan")
+    comparisons = relationship("ComparisonRun", back_populates="project", cascade="all, delete-orphan")
 
 
 class ValidationRun(Base):
@@ -54,6 +55,10 @@ class ValidationRun(Base):
 
     errors_by_type = Column(JSONB, default=list)
     errors_by_field = Column(JSONB, default=list)
+
+    processed_rows = Column(Integer, default=0)
+    total_rows = Column(Integer, default=0)
+    error_message = Column(Text)
 
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
@@ -185,6 +190,7 @@ class ComparisonRun(Base):
     ran_at = Column(TIMESTAMP(timezone=True))
     completed_at = Column(TIMESTAMP(timezone=True))
 
+    project = relationship("ValidationProject", back_populates="comparisons")
     discrepancies = relationship("ComparisonDiscrepancy", cascade="all, delete-orphan")
 
 

@@ -7,7 +7,7 @@ from config import settings
 from db.database import engine
 from db.models import Base
 from routers import auth, projects, validation, mapping, comparison, chat
-from services import s3_service
+from services import s3_service, job_queue
 
 app = FastAPI(title="MIGR8 AI — Validation API")
 
@@ -35,6 +35,12 @@ def on_startup():
     # For the hackathon: auto-create tables if they don't exist.
     # In practice, run schema.sql directly against Postgres instead.
     Base.metadata.create_all(bind=engine)
+    job_queue.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    job_queue.stop()
 
 
 @app.get("/health")

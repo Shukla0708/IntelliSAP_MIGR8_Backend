@@ -24,9 +24,11 @@ certifi>=2024.0.0
 # Bedrock API key path (REST bearer)
 httpx==0.27.2
 
-# Excel / comparison output
+# Excel / comparison output / large-file streaming
 openpyxl==3.1.5
 XlsxWriter==3.2.9
+polars==1.43.2
+fastexcel==0.2.0.2
 
 # Field mapping embeddings
 numpy==2.5.2

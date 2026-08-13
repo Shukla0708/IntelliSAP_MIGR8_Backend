@@ -36,7 +36,16 @@ def normalize_key(value) -> str:
         if value.is_integer():
             return str(int(value))
         return format(value, "g")
-    return normalize_raw(value)
+    raw = normalize_raw(value)
+    if raw and raw[0].isdigit() or (raw.startswith("-") and len(raw) > 1):
+        try:
+            number = float(raw)
+            if number.is_integer():
+                return str(int(number))
+            return format(number, "g")
+        except ValueError:
+            pass
+    return raw
 
 
 def is_empty_raw(raw: str) -> bool:
@@ -49,7 +58,6 @@ def validate_cell(value, field_cfg: dict, seen_keys: set | None) -> list[str]:
     Pass seen_keys=None to skip per-field uniqueness (used for composite keys).
     """
     reasons: list[str] = []
-    print(field_cfg)
 
     # Excel date cells arrive as datetime/date, not "21-05-2024".
     # Normalize early so date + regex checks see a stable string.
@@ -114,13 +122,18 @@ def validate_cell(value, field_cfg: dict, seen_keys: set | None) -> list[str]:
     ):
         reasons.append("Contains disallowed special characters")
 
-    if field_cfg["regex"]:
+    compiled = field_cfg.get("_compiled_regex")
+    pattern = field_cfg.get("regex")
+    if compiled is not None or pattern:
         try:
             # fullmatch: entire cell must match (re.match only anchors at start).
             # Excel date cells are datetime objects — also try common display forms
             # so a DD-MM-YYYY regex still passes a real date cell.
             candidates = _string_forms_for_regex(value, raw)
-            if not any(re.fullmatch(field_cfg["regex"], c) for c in candidates):
+            matcher = compiled.fullmatch if compiled is not None else (
+                lambda c, p=pattern: re.fullmatch(p, c)
+            )
+            if not any(matcher(c) for c in candidates):
                 reasons.append("Does not match configured rule")
         except re.error:
             pass  # malformed regex should never have been saved, but don't crash the run

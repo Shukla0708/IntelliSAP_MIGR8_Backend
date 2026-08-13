@@ -10,7 +10,6 @@ from schemas.validation import (
     RunFieldOut,
 )
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest, RenameMappingRequest
-from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
 from schemas.comparison import (
     ComparisonDiscrepancyOut,
     ComparisonReviewOut,

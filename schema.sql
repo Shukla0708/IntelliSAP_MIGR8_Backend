@@ -52,6 +52,10 @@ CREATE TABLE validation_runs (
     errors_by_type      JSONB DEFAULT '[]',
     errors_by_field     JSONB DEFAULT '[]',
 
+    processed_rows      INT DEFAULT 0,
+    total_rows          INT DEFAULT 0,
+    error_message       TEXT,
+
     created_by          UUID REFERENCES users(id),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     ran_at              TIMESTAMPTZ,
