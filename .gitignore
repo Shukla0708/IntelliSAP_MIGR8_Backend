@@ -19,3 +19,4 @@ local_storage/
 .DS_Store
 Thumbs.db
 *.log
+.claude_code_prompt_mapping_feature.md

@@ -110,3 +110,54 @@ CREATE TABLE validation_exceptions (
 );
 
 CREATE INDEX idx_exceptions_run_id ON validation_exceptions(run_id);
+
+-- ------------------------------------------------------------
+-- Field mapping — source field list + target SAP field list ->
+-- embedding-ranked candidates, re-scored/explained by an LLM.
+-- ------------------------------------------------------------
+CREATE TABLE mappings (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          UUID NOT NULL REFERENCES validation_projects(id) ON DELETE CASCADE,
+    mapping_name        TEXT NOT NULL DEFAULT 'New field mapping run',
+    status              TEXT NOT NULL DEFAULT 'processing'
+                         CHECK (status IN ('processing','completed','failed')),
+
+    source_filename     TEXT,
+    source_s3_key       TEXT,
+    target_filename     TEXT,
+    target_s3_key       TEXT,
+
+    total_source_fields INT DEFAULT 0,
+    mapped_fields       INT DEFAULT 0,      -- source fields that received >=1 candidate
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_mappings_project_id ON mappings(project_id);
+
+-- Top-3 candidates per source field, collapsed into one JSON array per row.
+-- Each element: {sap_table, sap_field, target_description, embedding_score,
+-- datatype_match_score, confidence_score, reasoning}.
+CREATE TABLE mapping_temp (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    mapping_id          UUID NOT NULL REFERENCES mappings(id) ON DELETE CASCADE,
+
+    source_field        TEXT NOT NULL,
+    mapping             JSONB NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX idx_mapping_temp_mapping_id ON mapping_temp(mapping_id);
+
+-- User-confirmed source -> target field mapping, one row per confirmed source field.
+CREATE TABLE final_mapping (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    mapping_id          UUID NOT NULL REFERENCES mappings(id) ON DELETE CASCADE,
+
+    source_field        TEXT NOT NULL,
+    target_field        TEXT NOT NULL,      -- "{sap_table}.{sap_field}"
+
+    UNIQUE (mapping_id, source_field)
+);
+
+CREATE INDEX idx_final_mapping_mapping_id ON final_mapping(mapping_id);

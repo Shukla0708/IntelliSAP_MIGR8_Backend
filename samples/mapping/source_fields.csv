@@ -1,0 +1,4 @@
+﻿Field Name,Description,Key Field,Datatype
+CUST_ID,Unique customer identifier in legacy CRM,Y,CHAR
+CUST_NAME,Full legal name of the customer,N,CHAR
+CUST_EMAIL,Primary email address for correspondence,N,STRING

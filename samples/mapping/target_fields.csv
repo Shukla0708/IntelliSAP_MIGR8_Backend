@@ -1,0 +1,4 @@
+﻿SAP Table,SAP Field,Description,Table Description,Datatype
+KNA1,KUNNR,Customer Number,General Data in Customer Master,CHAR
+KNA1,NAME1,Name 1,General Data in Customer Master,CHAR
+ADR6,SMTP_ADDR,E-Mail Address,E-Mail Addresses,STRING

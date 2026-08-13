@@ -51,21 +51,28 @@ backend/
 │   └── test_run_names.py   # Create-run naming + uniqueness
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
-│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception
+│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping
 ├── schemas/
 │   ├── __init__.py         # Re-exports for `from schemas import ...`
 │   ├── auth.py
 │   ├── projects.py
-│   └── validation.py
+│   ├── validation.py
+│   └── mapping.py          # ConfirmMappingRequest / ConfirmedFieldIn (mapping)
 ├── routers/
 │   ├── auth.py             # /api/auth/*
 │   ├── projects.py         # /api/projects/*
-│   └── validation.py       # /api/runs/*
+│   ├── validation.py       # /api/runs/*
+│   └── mapping.py          # /api/mappings/*
 └── services/
     ├── s3_service.py
     ├── excel_service.py
     ├── rules_engine.py
-    └── regex_generator.py
+    ├── regex_generator.py
+    ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
+    ├── embedding_service.py # local TF-IDF vectorizer, numpy only (mapping)
+    ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
+    ├── llm_mapping.py       # Groq re-rank + reasoning (mapping)
+    └── datatype_matcher.py  # hardcoded SAP-type compatibility matrix (mapping)
 ```
 
 ---
@@ -86,7 +93,7 @@ Copy `.env.example` → `.env`:
 | `S3_BUCKET` | no | Default `migr8-ai-validation` |
 | `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` |
 | `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
-| `GROQ_API_KEY` | for Rule 5 | Checkbox rules work without it; generate-regex needs Groq |
+| `GROQ_API_KEY` | for Rule 5 | Checkbox rules work without it; generate-regex needs Groq. Also used for field-mapping LLM re-rank (falls back to embedding-only scoring on failure) |
 
 CORS allows local frontend origins: `http://localhost:3000`, `http://127.0.0.1:3000`, plus common Vite ports `5173` / `4173` (and `:3001`). `localhost` and `127.0.0.1` are different origins — both are listed. Add any deployed frontend URL to `_CORS_ORIGINS` in `main.py`.
 
@@ -98,6 +105,9 @@ CORS allows local frontend origins: `http://localhost:3000`, `http://127.0.0.1:3
 users 1──* validation_projects 1──* validation_runs
                                       ├──* validation_fields
                                       └──* validation_exceptions
+                                 1──* mappings
+                                      ├──* mapping_temp
+                                      └──* final_mapping
 ```
 
 | Table | Role |
@@ -107,8 +117,12 @@ users 1──* validation_projects 1──* validation_runs
 | `validation_runs` | One upload → configure → execute cycle + aggregate stats; **`name` VARCHAR(120) NOT NULL**, unique per `(project_id, name)` |
 | `validation_fields` | Per-column rule flags/config for a run |
 | `validation_exceptions` | Capped failure samples (~60) for results UI |
+| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping" |
+| `mapping_temp` | One row per source field; `mapping` JSONB holds its top-3 SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
+| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row |
 
 **Run status:** `draft` → `rules_configured` → `running` → `completed` | `failed`
+**Mapping status:** `processing` → `completed` | `failed` (pipeline-only; confirmation is tracked separately by the presence of `final_mapping` rows, not a status value)
 
 **Run names:** User-provided at create time (trimmed, non-empty, ≤120 chars). No default like `"New validation run"`. Duplicate names within the same project → HTTP 409; the same name is allowed across different projects.
 
@@ -145,6 +159,40 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 | POST | `/` | Bearer | `{ name }` → `ProjectOut` |
 | GET | `/` | Bearer | List current user’s projects |
 | GET | `/{project_id}/runs` | Bearer | Runs list shaped for frontend cards (`id`, `name`, `records`, `ranAt`, `status`, `errors`) |
+
+### Field mapping — `/api/mappings`
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` (xlsx/csv). Creates the `mappings` row immediately ("Start Mapping"), then runs the pipeline synchronously (upload → parse → embed → top-3 → LLM re-rank → persist to `mapping_temp`) → mapping result JSON |
+| GET | `/{run_id}/result` | Bearer | Re-fetch the same result JSON from `mapping_temp` |
+| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"sourceField", "targetField"}]}`; validates each `targetField` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`) |
+
+**Source file** must have a Field Name column, a Description column, a **Key Field flag** column, and a **Datatype** column. **Target file** must have SAP Table, SAP Field, Description, **Table Description**, and **Datatype** columns (case-insensitive, some header aliases accepted — see `file_parser.py`). Key Field flag accepts `Y/N`, `X`, `TRUE/FALSE`, `1/0`, `yes/no` (case-insensitive), normalized to boolean.
+
+**Response shape** (camelCase). Note `sourceDescription` is not persisted (dropped from `mapping_temp`'s columns) and is omitted from the response:
+
+```json
+{
+  "mappingRunId": "...", "status": "completed",
+  "sourceFilename": "...", "targetFilename": "...", "totalSourceFields": 42, "mappedFields": 40,
+  "rows": [
+    {
+      "sourceField": "Customer Name",
+      "prospects": [
+        {
+          "targetField": "KNA1.NAME1", "sapTable": "KNA1", "sapField": "NAME1",
+          "targetDescription": "...", "semanticSimilarity": 0.83,
+          "datatypeMatchScore": 100, "confidence": 91.5,
+          "reasoning": "Direct semantic match ... (20-30 words)"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Ownership: every run/project access checks the JWT user owns the project.
 
 ### Validation runs — `/api/runs`
 
@@ -193,6 +241,26 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 
 `upload_bytes` / `download_bytes` / `presigned_url` — uses S3 when real AWS keys are set; otherwise **local disk** under `local_storage/` (`STORAGE_BACKEND=auto`).
 
+### `file_parser` (mapping)
+
+`parse_source_fields` / `parse_target_fields` — read `.csv` or `.xlsx`, match fixed headers case-insensitively (with a small alias list per column), return one dict per row. Raises `ValueError` (→ HTTP 422) if a required column isn't found or the file has no data rows. Source rows: `field_name`, `description`, `key_field` (bool, normalized from `Y/N`/`X`/`TRUE/FALSE`/`1/0`/`yes/no`), `datatype`. Target rows: `sap_table`, `sap_field`, `description`, `table_description`, `datatype`.
+
+### `embedding_service` (mapping)
+
+`embed_texts(list[str]) -> np.ndarray` — local character-trigram + word-bigram TF-IDF vectorizer, numpy only, no model download. Swap target: **fastembed** (`BAAI/bge-small-en-v1.5`) or **Cohere Embed v4** (`cohere.embed-v4:0`) — same function signature.
+
+### `mapping_engine` (mapping)
+
+`top_candidates` — embeds `"{field}: {description}"` for source rows and `"{table}.{field}: {description}"` for target rows, cosine-similarity matrix, returns the top 3 target candidates per source field with a raw `embedding_score` (-1..1) and a `datatype_match_score` (0-100, or `None` if either side's datatype is missing) from `datatype_matcher`.
+
+### `llm_mapping` (mapping)
+
+`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to Groq (`llama-3.3-70b-versatile`), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run. Swap target: **Claude Sonnet 4.5 / Sonnet 5 via Bedrock** — same function signature.
+
+### `datatype_matcher` (mapping)
+
+`datatype_match_score(source_datatype, target_datatype) -> float | None` — hardcoded SAP-type compatibility groups (e.g. `CHAR`/`STRING`/`TEXT`, `NUMC`/`INT`/`NUMBER`, `DATS`/`DATE`, `CURR`/`DEC`/`FLOAT`, `FLAG`/`BOOLEAN`). Exact match after normalization → 100, same group → 60, otherwise → 0. Returns `None` if either datatype is missing.
+
 ---
 
 ## Pydantic schemas (`schemas/`)
@@ -202,6 +270,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 | `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` — email is plain `str` with simple `@` / domain checks (not strict `EmailStr`) |
 | `projects.py` | `ProjectCreate`, `ProjectOut` — `id` always serialized as `str` (UUID coerced) |
 | `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest`, `RegexGenerateResponse` |
+| `mapping.py` | `ConfirmedFieldIn` (`source_field`, `target_field`), `ConfirmMappingRequest` (`fields: list[ConfirmedFieldIn]`) — body for `POST /{run_id}/confirm` |
 
 Routers import via `from schemas import ...` (`schemas/__init__.py` re-exports).
 
@@ -254,6 +323,9 @@ pytest tests/test_run_names.py -q
 10. **Rule 5 is LLM-only** — no deterministic regex shortcuts; Groq generates every custom pattern from plain English.
 11. **Date cells from Excel are typed values** — never rely on `str(datetime)` alone for format checks.
 12. **Validation run `name` is user-supplied and unique per project** — trim on input; empty → 422; unique violation → 409 with a stable detail message.
+13. **Embedding/LLM providers are behind stable function signatures on purpose** — `embedding_service.embed_texts()` (local TF-IDF now → fastembed/Cohere Embed v4 later) and `llm_mapping.rank_candidates()` (Groq now → Claude via Bedrock later) so swapping providers doesn't touch `mapping_engine`/`routers/mapping.py`.
+14. **`mapping_temp`/`final_mapping` are intentionally minimal** — `mapping_temp` only stores `id`, `mapping_id`, `source_field`, `mapping` (JSONB candidates); `final_mapping` only stores `id`, `mapping_id`, `source_field`, `target_field`. `sourceDescription` isn't persisted anywhere post-pipeline, and `final_mapping` carries no scores/reasoning/timestamps.
+15. **Mapping confirmation is per-field, not per-run** — `POST /{run_id}/confirm` accepts a list of `{sourceField, targetField}` pairs and upserts one `final_mapping` row per field (unique on `(mapping_id, source_field)`); re-confirming a field overwrites its previous choice rather than duplicating.
 
 ---
 
@@ -265,10 +337,22 @@ pytest tests/test_run_names.py -q
 - Stricter alignment of auto-created tables with `schema.sql` CHECKs
 - Server-side auth (httpOnly cookie) so results can SSR — frontend currently uses Bearer + readable cookie for middleware
 - Drop unused `passlib` from `requirements.txt` once confirmed unused
+- Field mapping: batch multiple source fields per LLM call (or queue+poll) instead of one call each, once field-list sizes grow
+- Field mapping: "Fetch from SAP" live target-table lookup isn't implemented — target field list is upload-only for now
+- Field mapping: `datatype_match_score` uses a hardcoded compatibility matrix (`services/datatype_matcher.py`); revisit if SAP type coverage needs to grow
+- Field mapping: no endpoint yet to list/edit already-confirmed `final_mapping` rows for a run (only upsert via `/confirm`)
 
 ---
 
 ## Session Log
+
+### 2026-08-13 — Field mapping feature (source → SAP target)
+
+- New tables `mappings`, `mapping_temp`, `final_mapping` (models `Mapping`, `MappingTemp`, `FinalMapping`), project-scoped like validation runs. `mappings` row is created immediately when "Start Mapping" is clicked, before the pipeline runs.
+- New router `routers/mapping.py`: `POST /api/mappings/?project_id=` (multipart `source_file` + `target_file`) runs parse → embed → top-3 → LLM re-rank synchronously and persists one `mapping_temp` row per source field (JSONB array of candidates); `GET /{run_id}/result` re-fetches it; `POST /{run_id}/confirm` validates and upserts confirmed picks into `final_mapping`.
+- New services: `file_parser` (adds Key Field flag + Datatype to source uploads, Table Description + Datatype to target uploads), `embedding_service` (local TF-IDF, numpy only), `mapping_engine` (cosine top-3 + datatype match score), `llm_mapping` (Groq re-rank + reasoning), `datatype_matcher` (hardcoded SAP-type compatibility matrix).
+- Response gained `datatypeMatchScore` per candidate and `mappedFields` on the run; `sourceDescription` is intentionally not persisted (dropped from `mapping_temp`'s minimal column set).
+- Added `numpy==1.26.4` to `requirements.txt`.
 
 ### 2026-08-13 — Logout endpoint
 

@@ -28,6 +28,7 @@ class ValidationProject(Base):
 
     user = relationship("User", back_populates="projects")
     runs = relationship("ValidationRun", back_populates="project", cascade="all, delete-orphan")
+    mappings = relationship("Mapping", cascade="all, delete-orphan")
 
 
 class ValidationRun(Base):
@@ -99,3 +100,48 @@ class ValidationException(Base):
     error_type = Column(String, nullable=False)
     severity = Column(String, default="error")
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class Mapping(Base):
+    __tablename__ = "mappings"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("validation_projects.id", ondelete="CASCADE"), nullable=False)
+    mapping_name = Column(String, default="New field mapping run")
+    status = Column(String, default="processing")  # processing | completed | failed
+
+    source_filename = Column(String)
+    source_s3_key = Column(String)
+    target_filename = Column(String)
+    target_s3_key = Column(String)
+
+    total_source_fields = Column(Integer, default=0)
+    mapped_fields = Column(Integer, default=0)  # source fields that received >=1 candidate
+
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    last_updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    temp_results = relationship("MappingTemp", cascade="all, delete-orphan")
+    final_results = relationship("FinalMapping", cascade="all, delete-orphan")
+
+
+class MappingTemp(Base):
+    __tablename__ = "mapping_temp"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    mapping_id = Column(UUID(as_uuid=True), ForeignKey("mappings.id", ondelete="CASCADE"))
+
+    source_field = Column(String, nullable=False)
+    # One entry per top-3 candidate: sap_table, sap_field, target_description,
+    # embedding_score, datatype_match_score, confidence_score, reasoning.
+    mapping = Column(JSONB, default=list)
+
+
+class FinalMapping(Base):
+    __tablename__ = "final_mapping"
+    __table_args__ = (
+        UniqueConstraint("mapping_id", "source_field", name="uq_final_mapping_mapping_source"),
+    )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    mapping_id = Column(UUID(as_uuid=True), ForeignKey("mappings.id", ondelete="CASCADE"))
+
+    source_field = Column(String, nullable=False)
+    target_field = Column(String, nullable=False)  # "{sap_table}.{sap_field}"

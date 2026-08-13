@@ -6,6 +6,7 @@ from schemas.validation import (
     RegexGenerateRequest,
     RegexGenerateResponse,
 )
+from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest
 
 __all__ = [
     "RegisterRequest",
@@ -18,4 +19,6 @@ __all__ = [
     "FieldRuleIn",
     "RegexGenerateRequest",
     "RegexGenerateResponse",
+    "ConfirmedFieldIn",
+    "ConfirmMappingRequest",
 ]
