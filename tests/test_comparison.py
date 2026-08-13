@@ -1,5 +1,6 @@
 """Tests for preload vs postload comparison runs."""
 import io
+import time
 import uuid
 
 import pytest
@@ -116,6 +117,25 @@ def _by_type(discrepancies: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _execute(client: TestClient, headers: dict, run_id: str, payload: dict | None = None):
+    res = client.post(
+        f"/api/comparisons/{run_id}/execute",
+        json=payload if payload is not None else {},
+        headers=headers,
+    )
+    assert res.status_code in (200, 202), res.text
+    body = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        result = client.get(f"/api/comparisons/{run_id}/result", headers=headers)
+        assert result.status_code == 200, result.text
+        body = result.json()
+        if body["status"] in ("completed", "failed"):
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"comparison {run_id} did not finish: {body}")
+
+
 def test_same_name_columns_compare_without_mapping(client, auth_user):
     headers = auth_user["headers"]
     project_id = _create_project(client, headers)
@@ -134,12 +154,7 @@ def test_same_name_columns_compare_without_mapping(client, auth_user):
     assert uploaded.status_code == 200, uploaded.text
     assert uploaded.json()["preload_fields"] == HEADER
 
-    executed = client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-    assert executed.status_code == 200, executed.text
-
-    result = client.get(f"/api/comparisons/{run_id}/result", headers=headers)
-    assert result.status_code == 200, result.text
-    body = result.json()
+    body = _execute(client, headers, run_id)
     assert body["status"] == "completed"
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 1
@@ -171,17 +186,10 @@ def test_explicit_composite_key_without_mapping(client, auth_user):
          ["100045", "2000", "changed@x.com", "90211"]],
     )
 
-    executed = client.post(
-        f"/api/comparisons/{run_id}/execute",
-        json={
+    body = _execute(client, headers, run_id, {
             "business_key_columns_preload": ["CUSTOMER_ID", "COMPANY_CODE"],
             "business_key_columns_postload": ["CUSTOMER_ID", "COMPANY_CODE"],
-        },
-        headers=headers,
-    )
-    assert executed.status_code == 200, executed.text
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+        })
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 1
     assert body["missingCount"] == 0
@@ -214,12 +222,7 @@ def test_mapping_with_single_key_field(client, auth_user, db):
     assert listed["confirmedFieldCount"] == 2
     assert listed["keyFieldCount"] == 1
 
-    executed = client.post(
-        f"/api/comparisons/{run_id}/execute", json={"mapping_id": mapping_id}, headers=headers
-    )
-    assert executed.status_code == 200, executed.text
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id, {"mapping_id": mapping_id})
     # Only EMAIL is compared, so the differing COMPANY_CODE/POSTAL_CODE are ignored.
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 1
@@ -247,12 +250,7 @@ def test_mapping_with_composite_key(client, auth_user, db):
          ["100045", "2000", "b@x.com", "90210"]],
     )
 
-    executed = client.post(
-        f"/api/comparisons/{run_id}/execute", json={"mapping_id": mapping_id}, headers=headers
-    )
-    assert executed.status_code == 200, executed.text
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id, {"mapping_id": mapping_id})
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 1
     assert body["missingCount"] == 0
@@ -290,9 +288,7 @@ def test_format_change_is_reported_as_info(client, auth_user):
         [HEADER, ["100045", "1000", "john@x.com", "90210"]],
         [HEADER, ["100045", "1000", "JOHN@X.COM", "90210"]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     change = _by_type(body["discrepancies"])["FORMAT_CHANGE"][0]
     assert change["status"] == "info"
     assert change["field"] == "EMAIL"
@@ -310,9 +306,7 @@ def test_zero_padded_keys_and_values_still_match(client, auth_user):
         [header, ["100045", "1000", "a@x.com"]],
         [header, ["0000100045", "0000001000", "a@x.com"]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 0
     assert body["missingCount"] == 0
@@ -330,9 +324,7 @@ def test_reformatted_numbers_and_dates_are_not_differences(client, auth_user):
         [header, ["500001", "1000", "2024-01-05", "-250.5"]],
         [header, ["0500001", "1,000.00", "05.01.2024", "250.50-"]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     assert body["matchedRecords"] == 1
     assert body["differentCount"] == 0
     assert body["discrepancies"] == []
@@ -350,9 +342,7 @@ def test_real_value_changes_survive_normalization(client, auth_user):
         [header, ["100045", "1000", "0"]],
         [header, ["100045", "1000.01", ""]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     assert body["matchedRecords"] == 0
     assert body["differentCount"] == 1
     mismatched = {row["field"] for row in _by_type(body["discrepancies"])["VALUE_MISMATCH"]}
@@ -371,9 +361,7 @@ def test_extra_postload_record_is_reported(client, auth_user):
          ["100045", "1000", "a@x.com", "90210"],
          ["100999", "1000", "new@x.com", "11111"]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     assert body["matchedRecords"] == 1
     assert body["missingCount"] == 1
     extra = _by_type(body["discrepancies"])["EXTRA_RECORD"][0]
@@ -389,9 +377,7 @@ def test_discrepancies_are_capped_at_fifty(client, auth_user):
     preload = [HEADER] + [[f"{i:06d}", "1000", f"old{i}@x.com", "90210"] for i in range(60)]
     postload = [HEADER] + [[f"{i:06d}", "1000", f"new{i}@x.com", "90211"] for i in range(60)]
     _upload(client, headers, run_id, preload, postload)
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
-
-    body = client.get(f"/api/comparisons/{run_id}/result", headers=headers).json()
+    body = _execute(client, headers, run_id)
     assert body["differentCount"] == 60
     assert len(body["discrepancies"]) == 50
 
@@ -410,7 +396,7 @@ def test_downloaded_report_has_preload_layout(client, auth_user, db):
          ["100045", "1000", "john@new.com", "90210"],
          ["100082", "1000", "amy@x.com", "90210"]],
     )
-    client.post(f"/api/comparisons/{run_id}/execute", json={}, headers=headers)
+    _execute(client, headers, run_id)
 
     url = client.get(f"/api/comparisons/{run_id}/download-url", headers=headers)
     assert url.status_code == 200, url.text

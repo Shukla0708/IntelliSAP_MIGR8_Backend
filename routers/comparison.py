@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,7 +24,7 @@ from schemas import (
     CreateComparisonRequest,
     ExecuteComparisonRequest,
 )
-from services import comparison_engine, comparison_file_service, s3_service
+from services import comparison_file_service, job_queue, s3_service
 
 router = APIRouter(prefix="/api/comparisons", tags=["comparison"])
 logger = logging.getLogger(__name__)
@@ -138,15 +139,6 @@ async def upload_files(
     if not preload_fields or not postload_fields:
         raise HTTPException(400, "Both files need a header row with column names")
 
-    for upload, data in ((preload_file, preload_bytes), (postload_file, postload_bytes)):
-        row_count = comparison_file_service.count_data_rows(data)
-        if row_count is not None and row_count > comparison_file_service.MAX_ROWS:
-            raise HTTPException(
-                400,
-                f"'{upload.filename}' has {row_count:,} rows; the comparison limit is "
-                f"{comparison_file_service.MAX_ROWS:,}",
-            )
-
     preload_key = f"comparisons/{run_id}/preload/{preload_file.filename}"
     postload_key = f"comparisons/{run_id}/postload/{postload_file.filename}"
     s3_service.upload_bytes(preload_key, preload_bytes, comparison_file_service.XLSX_CONTENT_TYPE)
@@ -202,6 +194,8 @@ def execute_comparison(
     run = _get_owned_run(run_id, db, current_user)
     if not run.preload_s3_key or not run.postload_s3_key:
         raise HTTPException(400, "Upload both a preload and a postload file first")
+    if run.status == "running":
+        raise HTTPException(status.HTTP_409_CONFLICT, "This comparison is already executing")
 
     mapping_rows = None
     if payload.mapping_id:
@@ -219,6 +213,12 @@ def execute_comparison(
             }
             for row in confirmed
         ]
+        if not any(row["is_key"] for row in mapping_rows):
+            raise HTTPException(
+                422,
+                "The selected mapping has no key field. Key fields come from the key column "
+                "of the uploaded source schema, so re-run the mapping with keys flagged there.",
+            )
 
     run.mapping_id = payload.mapping_id
     run.business_key_columns_preload = payload.business_key_columns_preload
@@ -226,46 +226,8 @@ def execute_comparison(
     run.status = "running"
     run.ran_at = datetime.utcnow()
     db.commit()
-
-    try:
-        preload_bytes = s3_service.download_bytes(run.preload_s3_key)
-        postload_bytes = s3_service.download_bytes(run.postload_s3_key)
-
-        plan = comparison_engine.build_plan(
-            comparison_file_service.read_header(preload_bytes),
-            comparison_file_service.read_header(postload_bytes),
-            mapping_rows=mapping_rows,
-            business_key_preload=payload.business_key_columns_preload,
-            business_key_postload=payload.business_key_columns_postload,
-        )
-        result_bytes, stats, discrepancies = comparison_engine.run_comparison(
-            preload_bytes, postload_bytes, plan
-        )
-    except ValueError as exc:
-        run.status = "draft"
-        db.commit()
-        raise HTTPException(422, str(exc))
-    except Exception as exc:
-        logger.exception("Comparison run %s failed", run_id)
-        run.status = "failed"
-        db.commit()
-        raise HTTPException(500, f"Comparison run failed: {exc}")
-
-    result_key = f"comparisons/{run_id}/result/comparison_{run.preload_filename}"
-    s3_service.upload_bytes(result_key, result_bytes, comparison_file_service.XLSX_CONTENT_TYPE)
-
-    db.query(ComparisonDiscrepancy).filter_by(run_id=run_id).delete()
-    for entry in discrepancies:
-        db.add(ComparisonDiscrepancy(run_id=run_id, **entry))
-
-    for key, value in stats.items():
-        setattr(run, key, value)
-    run.result_s3_key = result_key
-    run.status = "completed"
-    run.completed_at = datetime.utcnow()
-    db.commit()
-
-    return {"run_id": str(run_id), "status": "completed"}
+    job_queue.submit_comparison(run_id)
+    return JSONResponse({"run_id": str(run_id), "status": "running"}, status_code=202)
 
 
 @router.get("/{run_id}/result", response_model=ComparisonReviewOut)

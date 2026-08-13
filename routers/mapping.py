@@ -1,12 +1,14 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from db.database import get_db
 from db.models import User, ValidationProject, Mapping, MappingTemp, FinalMapping
 from auth import get_current_user
 from schemas import ConfirmMappingRequest, RenameMappingRequest
-from services import s3_service, file_parser, mapping_engine, llm_mapping, datatype_matcher
+from services import job_queue, s3_service, file_parser
 
 NUMBER_RANGE_TYPES = ("internal", "external")
 DEFAULT_MAPPING_NAME = "New field mapping run"
@@ -49,6 +51,43 @@ def _target_catalog(mapping: Mapping) -> list[dict]:
         raise
     except Exception as exc:
         raise HTTPException(422, f"Could not read the target field list: {exc}")
+
+
+def _candidate_key(candidate: dict) -> str:
+    return f"{candidate.get('sap_table', '')}.{candidate.get('sap_field', '')}"
+
+
+def _split_target_field(target_field: str) -> tuple[str, str]:
+    if "." in target_field:
+        table, field = target_field.split(".", 1)
+        return table, field
+    return "", target_field
+
+
+def _persist_user_selected_candidate(
+    temp: MappingTemp,
+    target_field: str,
+    catalog_by_key: dict,
+) -> None:
+    """Keep AI top-3 candidates and persist a pick from outside that list."""
+    kept = [c for c in (temp.mapping or []) if not c.get("user_selected")]
+    if target_field not in {_candidate_key(c) for c in kept}:
+        catalog = catalog_by_key.get(target_field) or {}
+        sap_table, sap_field = _split_target_field(target_field)
+        kept.append({
+            "sap_table": catalog.get("sap_table") or sap_table,
+            "sap_field": catalog.get("sap_field") or sap_field,
+            "target_description": catalog.get("description"),
+            "embedding_score": None,
+            "datatype_match_score": None,
+            "confidence_score": None,
+            "reasoning": "Selected by the user from the full target list.",
+            "user_selected": True,
+        })
+    temp.mapping = kept
+    flag_modified(temp, "mapping")
+
+
 def confirmed_counts(db: Session, mapping_id: uuid.UUID) -> tuple[int, int]:
     """(confirmed fields, key fields) — key fields form the comparison business key."""
     flags = [row for (row,) in db.query(FinalMapping.key).filter_by(mapping_id=mapping_id).all()]
@@ -68,6 +107,7 @@ def _serialize(mapping: Mapping, temp_rows: list[MappingTemp], confirmed_by_fiel
             "datatypeMatchScore": c.get("datatype_match_score"),
             "confidence": c.get("confidence_score"),
             "reasoning": c.get("reasoning"),
+            "userSelected": bool(c.get("user_selected")),
         } for c in (t.mapping or [])]
         rows.append({
             "sourceField": t.source_field,
@@ -178,74 +218,8 @@ async def create_mapping_run(
     mapping.target_s3_key = target_key
     db.commit()
 
-    try:
-        source_fields = file_parser.parse_source_fields(source_bytes, source_file.filename)
-        target_fields = file_parser.parse_target_fields(target_bytes, target_file.filename)
-        if not source_fields:
-            raise ValueError("Source field list is empty")
-        if not target_fields:
-            raise ValueError("Target SAP field list is empty")
-
-        raw_matches = mapping_engine.top_candidates(source_fields, target_fields)
-
-        db.query(MappingTemp).filter_by(mapping_id=mapping.id).delete()
-        mapped_fields = 0
-        for match in raw_matches:
-            is_manual_key = number_range_type == "internal" and match["key_field"]
-
-            if is_manual_key:
-                # Internal number range: SAP assigns this key itself, so the AI
-                # must not pre-map it — hand the user the full target catalog
-                # to search and pick from instead.
-                final_candidates = [{
-                    "sap_table": t["sap_table"],
-                    "sap_field": t["sap_field"],
-                    "target_description": t.get("description"),
-                    "embedding_score": None,
-                    "datatype_match_score": datatype_matcher.datatype_match_score(
-                        match["datatype"], t.get("datatype")
-                    ),
-                    "confidence_score": None,
-                    "reasoning": "Key field under an internal number range — map this manually.",
-                } for t in target_fields]
-            else:
-                try:
-                    final_candidates = llm_mapping.rank_candidates(
-                        match["source_field"], match["source_description"], match["candidates"]
-                    )
-                except Exception:
-                    # LLM unavailable/invalid response — fall back to embedding-only ranking
-                    final_candidates = [{
-                        "sap_table": c["sap_table"],
-                        "sap_field": c["sap_field"],
-                        "target_description": c.get("target_description"),
-                        "embedding_score": c["embedding_score"],
-                        "datatype_match_score": c.get("datatype_match_score"),
-                        "confidence_score": round(c["embedding_score"] * 100, 2),
-                        "reasoning": "LLM ranking unavailable; ranked by embedding similarity only.",
-                    } for c in match["candidates"]]
-
-                if final_candidates:
-                    mapped_fields += 1
-
-            db.add(MappingTemp(
-                mapping_id=mapping.id,
-                source_field=match["source_field"],
-                key_field=match["key_field"],
-                mapping=final_candidates,
-            ))
-
-        mapping.total_source_fields = len(source_fields)
-        mapping.mapped_fields = mapped_fields
-        mapping.status = "completed"
-        db.commit()
-    except Exception as exc:
-        mapping.status = "failed"
-        db.commit()
-        raise HTTPException(422, f"Field mapping failed: {exc}")
-
-    temp_rows = db.query(MappingTemp).filter_by(mapping_id=mapping.id).all()
-    return _serialize(mapping, temp_rows)
+    job_queue.submit_mapping(mapping.id)
+    return JSONResponse(_serialize(mapping, []), status_code=202)
 
 
 @router.get("/{run_id}/result")
@@ -321,9 +295,12 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
     # top-3, so the catalog is the source of truth here. If it can't be read we
     # fall back to the per-row candidates.
     try:
-        catalog_keys = {f"{t['sap_table']}.{t['sap_field']}" for t in _target_catalog(mapping)}
+        catalog_by_key = {
+            f"{t['sap_table']}.{t['sap_field']}": t for t in _target_catalog(mapping)
+        }
     except HTTPException:
-        catalog_keys = set()
+        catalog_by_key = {}
+    catalog_keys = set(catalog_by_key)
 
     confirmed = []
     for item in payload.fields:
@@ -331,11 +308,13 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
         if temp is None:
             raise HTTPException(404, f"Source field '{item.source_field}' not found in this mapping run")
 
-        candidate_keys = {f"{c['sap_table']}.{c['sap_field']}" for c in (temp.mapping or [])}
+        candidate_keys = {_candidate_key(c) for c in (temp.mapping or [])}
         if item.target_field not in candidate_keys and item.target_field not in catalog_keys:
             raise HTTPException(
                 422, f"'{item.target_field}' is not a field in this run's target list"
             )
+
+        _persist_user_selected_candidate(temp, item.target_field, catalog_by_key)
 
         existing = db.query(FinalMapping).filter_by(
             mapping_id=mapping.id, source_field=item.source_field

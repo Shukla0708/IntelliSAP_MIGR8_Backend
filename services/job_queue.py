@@ -1,4 +1,4 @@
-"""In-process job queue for long validation runs."""
+"""In-process job queue for long validation, mapping, and comparison runs."""
 from __future__ import annotations
 
 import logging
@@ -7,20 +7,33 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-from db.database import SessionLocal
-from db.models import ValidationException, ValidationField, ValidationRun
-from services import excel_service, s3_service
+from sqlalchemy import text
+
+from db.database import SessionLocal, engine
+from db.models import (
+    ComparisonDiscrepancy,
+    ComparisonRun,
+    FinalMapping,
+    Mapping,
+    ValidationException,
+    ValidationField,
+    ValidationRun,
+)
+from services import comparison_engine, comparison_file_service, excel_service, s3_service
+from services.mapping_pipeline import run_mapping_job
 
 logger = logging.getLogger(__name__)
 
 _executor: ThreadPoolExecutor | None = None
 
 
-def start() -> None:
+def start(*, recover_stale: bool = True) -> None:
     global _executor
+    _ensure_runtime_columns()
+    if recover_stale:
+        _fail_stale_jobs()
     if _executor is None:
         _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="migr8-job")
-    _fail_stale_jobs()
 
 
 def stop() -> None:
@@ -31,10 +44,36 @@ def stop() -> None:
 
 
 def submit_validation(run_id: uuid.UUID) -> None:
+    _submit(_safe_validation, run_id)
+
+
+def submit_mapping(run_id: uuid.UUID) -> None:
+    _submit(_safe_mapping, run_id)
+
+
+def submit_comparison(run_id: uuid.UUID) -> None:
+    _submit(_safe_comparison, run_id)
+
+
+def _submit(fn, run_id: uuid.UUID) -> None:
     if _executor is None:
-        start()
+        start(recover_stale=False)
     assert _executor is not None
-    _executor.submit(_safe_validation, run_id)
+    _executor.submit(fn, run_id)
+
+
+def _ensure_runtime_columns() -> None:
+    statements = [
+        "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS processed_rows INT DEFAULT 0",
+        "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS total_rows INT DEFAULT 0",
+        "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS error_message TEXT",
+    ]
+    try:
+        with engine.begin() as conn:
+            for sql in statements:
+                conn.execute(text(sql))
+    except Exception:
+        logger.exception("Could not ensure large-file progress columns")
 
 
 def _fail_stale_jobs() -> None:
@@ -45,10 +84,18 @@ def _fail_stale_jobs() -> None:
             {"status": "failed", "error_message": interrupted},
             synchronize_session=False,
         )
+        db.query(Mapping).filter(Mapping.status == "processing").update(
+            {"status": "failed"},
+            synchronize_session=False,
+        )
+        db.query(ComparisonRun).filter(ComparisonRun.status == "running").update(
+            {"status": "failed"},
+            synchronize_session=False,
+        )
         db.commit()
     except Exception:
         db.rollback()
-        logger.exception("Could not mark stale validation jobs as failed")
+        logger.exception("Could not mark stale jobs as failed")
     finally:
         db.close()
 
@@ -58,6 +105,20 @@ def _safe_validation(run_id: uuid.UUID) -> None:
         _run_validation_job(run_id)
     except Exception:
         logger.exception("Validation job crashed for run %s", run_id)
+
+
+def _safe_mapping(run_id: uuid.UUID) -> None:
+    try:
+        run_mapping_job(run_id)
+    except Exception:
+        logger.exception("Mapping job crashed for run %s", run_id)
+
+
+def _safe_comparison(run_id: uuid.UUID) -> None:
+    try:
+        _run_comparison_job(run_id)
+    except Exception:
+        logger.exception("Comparison job crashed for run %s", run_id)
 
 
 def _run_validation_job(run_id: uuid.UUID) -> None:
@@ -125,5 +186,63 @@ def _run_validation_job(run_id: uuid.UUID) -> None:
             run.error_message = str(exc)[:2000]
             db.commit()
         logger.exception("Validation job failed for run %s", run_id)
+    finally:
+        db.close()
+
+
+def _run_comparison_job(run_id: uuid.UUID) -> None:
+    db = SessionLocal()
+    try:
+        run = db.get(ComparisonRun, run_id)
+        if not run or not run.preload_s3_key or not run.postload_s3_key:
+            return
+
+        mapping_rows = None
+        if run.mapping_id:
+            confirmed = db.query(FinalMapping).filter_by(mapping_id=run.mapping_id).all()
+            mapping_rows = [
+                {
+                    "source_field": row.source_field,
+                    "target_field": row.target_field,
+                    "is_key": bool(row.key),
+                }
+                for row in confirmed
+            ]
+
+        preload_bytes = s3_service.download_bytes(run.preload_s3_key)
+        postload_bytes = s3_service.download_bytes(run.postload_s3_key)
+        plan = comparison_engine.build_plan(
+            comparison_file_service.read_header(preload_bytes),
+            comparison_file_service.read_header(postload_bytes),
+            mapping_rows=mapping_rows,
+            business_key_preload=run.business_key_columns_preload or [],
+            business_key_postload=run.business_key_columns_postload or [],
+        )
+        result_bytes, stats, discrepancies = comparison_engine.run_comparison(
+            preload_bytes, postload_bytes, plan,
+        )
+
+        result_key = f"comparisons/{run_id}/result/comparison_{run.preload_filename}"
+        s3_service.upload_bytes(
+            result_key, result_bytes, comparison_file_service.XLSX_CONTENT_TYPE,
+        )
+
+        db.query(ComparisonDiscrepancy).filter_by(run_id=run_id).delete()
+        for entry in discrepancies:
+            db.add(ComparisonDiscrepancy(run_id=run_id, **entry))
+
+        for key, value in stats.items():
+            setattr(run, key, value)
+        run.result_s3_key = result_key
+        run.status = "completed"
+        run.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        run = db.get(ComparisonRun, run_id)
+        if run:
+            run.status = "failed"
+            db.commit()
+        logger.exception("Comparison job failed for run %s: %s", run_id, exc)
     finally:
         db.close()
