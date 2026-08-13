@@ -20,6 +20,7 @@ DATE_FORMATS = (
 def validate_cell(value, field_cfg: dict, seen_keys: set) -> list[str]:
     """Returns a list of human-readable failure reasons for a single cell."""
     reasons: list[str] = []
+    print(field_cfg)
 
     # Excel date cells arrive as datetime/date, not "21-05-2024".
     # Normalize early so date + regex checks see a stable string.

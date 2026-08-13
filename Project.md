@@ -27,10 +27,10 @@
 | Auth | **JWT** (`python-jose`) + **bcrypt** (direct; not passlib) | Bearer token |
 | Files | **boto3** → S3, or **local disk** | `STORAGE_BACKEND=auto|local|s3` |
 | Excel | **openpyxl** | Headers, red-fill failures, reason column |
-| AI rules | **Groq** `llama-3.3-70b-versatile` | Plain English → regex |
+| AI rules | **AWS Bedrock** Claude Sonnet 5 | Plain English → regex; field-mapping re-rank |
 | Config | **pydantic-settings** | Loads `.env` |
 | Schemas | **Pydantic v2** | Package under `schemas/` |
-| Python | **3.13 tested on Windows** | Needs `psycopg2-binary>=2.9.11`, `httpx==0.27.2` (Groq compat) |
+| Python | **3.13 tested on Windows** | Needs `psycopg2-binary>=2.9.11` |
 
 ---
 
@@ -48,7 +48,7 @@ backend/
 ├── .env.example
 ├── Project.md              # This file
 ├── tests/
-│   └── test_project_report.py # GET /api/projects/{id}/report
+│   └── test_bedrock_llm.py  # Mocked Bedrock regex + mapping tests
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
 │   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping
@@ -66,6 +66,8 @@ backend/
 │   ├── validation.py       # /api/runs/*
 │   └── mapping.py          # /api/mappings/*
 └── services/
+    ├── aws_client.py        # IAM-role-aware boto3 clients
+    ├── bedrock_llm.py       # Bedrock Converse API wrapper
     ├── s3_service.py
     ├── excel_service.py
     ├── rules_engine.py
@@ -73,7 +75,7 @@ backend/
     ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
     ├── embedding_service.py # local TF-IDF vectorizer, numpy only (mapping)
     ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
-    ├── llm_mapping.py       # Groq re-rank + reasoning (mapping)
+    ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
     └── datatype_matcher.py  # hardcoded SAP-type compatibility matrix (mapping)
 ```
 
@@ -89,15 +91,16 @@ Copy `.env.example` → `.env`:
 | `JWT_SECRET` | yes | Signing key for access tokens |
 | `JWT_ALGORITHM` | no | Default `HS256` |
 | `JWT_EXPIRE_MINUTES` | no | Default `1440` (24h) |
-| `AWS_ACCESS_KEY_ID` | for S3 | Can stay `your-key` — then storage uses local disk |
-| `AWS_SECRET_ACCESS_KEY` | for S3 | Same |
+| `AWS_ACCESS_KEY_ID` | optional | Omit on EC2 — IAM instance role used instead |
+| `AWS_SECRET_ACCESS_KEY` | optional | Same |
 | `AWS_REGION` | no | Default `ap-south-1` |
 | `S3_BUCKET` | no | Default `migr8-ai-validation` |
-| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` |
+| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` — use `s3` on EC2 |
 | `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
-| `GROQ_API_KEY` | for Rule 5 | Checkbox rules work without it; generate-regex needs Groq. Also used for field-mapping LLM re-rank (falls back to embedding-only scoring on failure) |
+| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` — regex + mapping LLM |
+| `CORS_ORIGINS` | no | Comma-separated frontend origins (add EC2 URL on deploy) |
 
-CORS allows local frontend origins: `http://localhost:3000`, `http://127.0.0.1:3000`, plus common Vite ports `5173` / `4173` (and `:3001`). `localhost` and `127.0.0.1` are different origins — both are listed. Add any deployed frontend URL to `_CORS_ORIGINS` in `main.py`.
+CORS origins are read from `CORS_ORIGINS` in `.env` (comma-separated). Default includes localhost ports. On EC2, add `http://<ec2-ip>:3000` (or your nginx domain).
 
 ---
 
@@ -238,9 +241,9 @@ Per-cell checks driven by field config:
 
 ### `regex_generator`
 
-**Always LLM-driven (hackathon Rule 5):** Groq `llama-3.3-70b-versatile` turns plain English → JSON `{"regex":"..."}`. Pattern is compiled before return; stray `^`/`$` anchors are stripped because the engine uses `re.fullmatch`. System prompt includes few-shot examples (e.g. `"starts with H4"` → `H4.*`) so the model rejects values that break the rule.
+**Always LLM-driven (hackathon Rule 5):** Bedrock Claude Sonnet 5 (`bedrock_llm.chat` via Converse API) turns plain English → JSON `{"regex":"..."}`. Pattern is compiled before return; stray `^`/`$` anchors are stripped because the engine uses `re.fullmatch`. System prompt includes few-shot examples (e.g. `"starts with H4"` → `H4.*`) so the model rejects values that break the rule.
 
-On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq again and stores the resulting `regex` (so Rule 5 stays LLM-backed even if the UI Generate button was skipped). Falls back to any client-supplied `regex` if generation fails.
+On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Bedrock again and stores the resulting `regex` (so Rule 5 stays LLM-backed even if the UI Generate button was skipped). Falls back to any client-supplied `regex` if generation fails.
 
 ### `s3_service`
 
@@ -260,7 +263,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 
 ### `llm_mapping` (mapping)
 
-`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to Groq (`llama-3.3-70b-versatile`), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run. Swap target: **Claude Sonnet 4.5 / Sonnet 5 via Bedrock** — same function signature.
+`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to **Bedrock** (`BEDROCK_MODEL_ID`, default Claude Sonnet 5), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run.
 
 ### `datatype_matcher` (mapping)
 
@@ -326,10 +329,10 @@ pytest tests/test_run_names.py -q
 7. **Hash passwords with `bcrypt` directly** — avoid passlib + bcrypt 5.x wrap-bug crash on Windows/Python 3.13.
 8. **Always `str(uuid)` in API response models** — FastAPI response validation rejects raw `UUID` when the schema field is `str` (see `ProjectOut` / projects router).
 9. **Storage:** `STORAGE_BACKEND=auto` uses local disk when AWS keys are placeholders; set real keys + `s3` for cloud.
-10. **Rule 5 is LLM-only** — no deterministic regex shortcuts; Groq generates every custom pattern from plain English.
+10. **Rule 5 is LLM-only** — no deterministic regex shortcuts; Bedrock generates every custom pattern from plain English.
 11. **Date cells from Excel are typed values** — never rely on `str(datetime)` alone for format checks.
 12. **Validation run `name` is user-supplied and unique per project** — trim on input; empty → 422; unique violation → 409 with a stable detail message.
-13. **Embedding/LLM providers are behind stable function signatures on purpose** — `embedding_service.embed_texts()` (local TF-IDF now → fastembed/Cohere Embed v4 later) and `llm_mapping.rank_candidates()` (Groq now → Claude via Bedrock later) so swapping providers doesn't touch `mapping_engine`/`routers/mapping.py`.
+13. **Embedding/LLM providers are behind stable function signatures on purpose** — `embedding_service.embed_texts()` (local TF-IDF now → fastembed/Cohere Embed v4 later) and `llm_mapping.rank_candidates()` (Bedrock Claude Sonnet 5) so swapping models is env-only (`BEDROCK_MODEL_ID`).
 14. **`mapping_temp`/`final_mapping` are intentionally minimal** — `mapping_temp` only stores `id`, `mapping_id`, `source_field`, `mapping` (JSONB candidates); `final_mapping` only stores `id`, `mapping_id`, `source_field`, `target_field`. `sourceDescription` isn't persisted anywhere post-pipeline, and `final_mapping` carries no scores/reasoning/timestamps.
 15. **Mapping confirmation is per-field, not per-run** — `POST /{run_id}/confirm` accepts a list of `{sourceField, targetField}` pairs and upserts one `final_mapping` row per field (unique on `(mapping_id, source_field)`); re-confirming a field overwrites its previous choice rather than duplicating.
 
@@ -367,6 +370,15 @@ pytest tests/test_run_names.py -q
 
 - Added `GET /api/runs/` (optional `project_id`, `limit`, `offset`) joining runs → owned projects for the current user; response includes `project_id` / `project_name` for Activity UI.
 - Test: `test_list_runs_across_projects` in `tests/test_run_names.py`.
+
+### 2026-08-13 — Bedrock LLM + EC2 IAM (Groq removed)
+
+- Replaced Groq with **AWS Bedrock Converse API** (`services/bedrock_llm.py`) for regex generation and field-mapping re-rank.
+- Default model: `us.anthropic.claude-sonnet-5` (configurable via `BEDROCK_MODEL_ID`).
+- Added `services/aws_client.py` — boto3 uses EC2 IAM role when access keys are unset.
+- `STORAGE_BACKEND=s3` forces S3 without static keys; `CORS_ORIGINS` env var for EC2 frontend.
+- Removed `groq` and `httpx` from `requirements.txt`; `/health` returns `llm` + `model`.
+- Tests: `tests/test_bedrock_llm.py` (mocked).
 
 ### 2026-08-13 — Project report endpoint
 

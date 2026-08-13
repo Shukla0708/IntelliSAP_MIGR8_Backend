@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from urllib.parse import unquote
 
+from config import settings
 from db.database import engine
 from db.models import Base
 from routers import auth, projects, validation, mapping
@@ -10,18 +11,7 @@ from services import s3_service
 
 app = FastAPI(title="MIGR8 AI — Validation API")
 
-# Local frontend origins (localhost vs 127.0.0.1 are different for CORS).
-# Axios "Network Error" on upload is often a blocked preflight from a missing origin.
-_CORS_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3001",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:4173",
-    "http://127.0.0.1:4173",
-]
+_CORS_ORIGINS = settings.cors_origin_list()
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +37,13 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "storage": s3_service.storage_mode()}
+    return {
+        "status": "ok",
+        "storage": s3_service.storage_mode(),
+        "llm": "bedrock",
+        "model": settings.bedrock_model_id,
+        "bedrock_region": settings.bedrock_region,
+    }
 
 
 @app.get("/api/local-files/{key:path}")
