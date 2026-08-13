@@ -152,8 +152,9 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| GET | `/` | Bearer | Cross-project list for current user; optional `project_id`, `limit`, `offset`; includes `project_id` + `project_name` |
+| GET | `/` | Bearer | Cross-project list for current user; optional `project_id`, `limit`, `offset`; includes `project_id` + `project_name`; returns real statuses (`draft`, `rules_configured`, etc.) |
 | POST | `/?project_id=` | Bearer | Body `{ name }` (trimmed, required) → `{ run_id }`; duplicate name in project → **409** |
+| GET | `/{run_id}` | Bearer | Run detail for draft edit UI: `name`, `status`, `source_filename`, `has_source_file`, `fields[]` with rule config |
 | POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3; returns `{ fields }` |
 | PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config |
 | POST | `/generate-regex` | Bearer | `{ field_name, prompt }` → `{ regex }` |
@@ -273,6 +274,12 @@ pytest tests/test_run_names.py -q
 ---
 
 ## Session Log
+
+### 2026-08-13 — Validation run detail + real list statuses
+
+- Added `GET /api/runs/{run_id}` (`RunDetailOut`) for frontend draft resume at `/validation/[id]`.
+- List endpoints (`GET /api/runs/`, `GET /api/projects/{id}/runs`) now return real `draft` / `rules_configured` statuses instead of mapping them to `running`.
+- Test: `test_get_run_detail` in `tests/test_run_names.py`.
 
 ### 2026-08-13 — Cross-project runs list
 

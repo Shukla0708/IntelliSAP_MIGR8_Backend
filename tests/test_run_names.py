@@ -141,3 +141,40 @@ def test_empty_name_returns_422(client, auth_user):
         headers=headers,
     )
     assert res.status_code == 422
+
+
+def test_get_run_detail(client, auth_user):
+    headers = auth_user["headers"]
+    project_id = _create_project(client, headers, f"Proj-{uuid.uuid4().hex[:8]}")
+
+    created = client.post(
+        f"/api/runs/?project_id={project_id}",
+        json={"name": "Detail Run"},
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    run_id = created.json()["run_id"]
+
+    detail = client.get(f"/api/runs/{run_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["id"] == run_id
+    assert body["name"] == "Detail Run"
+    assert body["status"] == "draft"
+    assert body["has_source_file"] is False
+    assert body["fields"] == []
+
+    rules = client.put(
+        f"/api/runs/{run_id}/rules",
+        json=[{
+            "field_name": "CUSTOMER_ID",
+            "flag_key": True,
+            "flag_mandatory": True,
+        }],
+        headers=headers,
+    )
+    assert rules.status_code == 200, rules.text
+
+    listed = client.get(f"/api/projects/{project_id}/runs", headers=headers)
+    match = next(r for r in listed.json() if r["id"] == run_id)
+    assert match["status"] == "rules_configured"

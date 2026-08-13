@@ -8,7 +8,14 @@ from db.database import get_db
 from db.models import User, ValidationRun, ValidationField, ValidationException, ValidationProject
 from auth import get_current_user
 from services import excel_service, s3_service, regex_generator
-from schemas import CreateRunRequest, FieldRuleIn, RegexGenerateRequest, RegexGenerateResponse
+from schemas import (
+    CreateRunRequest,
+    FieldRuleIn,
+    RegexGenerateRequest,
+    RegexGenerateResponse,
+    RunDetailOut,
+    RunFieldOut,
+)
 
 router = APIRouter(prefix="/api/runs", tags=["validation"])
 
@@ -23,10 +30,13 @@ def _get_owned_run(run_id: uuid.UUID, db: Session, current_user: User) -> Valida
     return run
 
 
+_VALID_STATUSES = ("draft", "rules_configured", "running", "completed", "failed")
+
+
 def _list_status(status: str | None) -> str:
-    if status in ("completed", "failed", "running"):
+    if status in _VALID_STATUSES:
         return status
-    return "running"
+    return "draft"
 
 
 @router.get("/")
@@ -98,6 +108,48 @@ def create_run(
         )
     db.refresh(run)
     return {"run_id": str(run.id)}
+
+
+@router.get("/{run_id}", response_model=RunDetailOut)
+def get_run(
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = _get_owned_run(run_id, db, current_user)
+    field_rows = (
+        db.query(ValidationField)
+        .filter_by(run_id=run_id)
+        .order_by(ValidationField.column_index)
+        .all()
+    )
+    return RunDetailOut(
+        id=str(run.id),
+        project_id=str(run.project_id),
+        name=run.name,
+        status=run.status or "draft",
+        source_filename=run.source_filename,
+        has_source_file=bool(run.source_s3_key),
+        fields=[
+            RunFieldOut(
+                field_name=f.field_name,
+                flag_key=f.flag_key or False,
+                flag_mandatory=f.flag_mandatory or False,
+                flag_null=f.flag_null or False,
+                flag_email=f.flag_email or False,
+                flag_mobile=f.flag_mobile or False,
+                flag_date=f.flag_date or False,
+                flag_special_chars=f.flag_special_chars or False,
+                case_format=f.case_format,
+                data_type=f.data_type or "string",
+                max_length=f.max_length,
+                decimal_length=f.decimal_length,
+                regex=f.regex,
+                regex_prompt=f.regex_prompt,
+            )
+            for f in field_rows
+        ],
+    )
 
 
 @router.post("/{run_id}/upload")

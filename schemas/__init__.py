@@ -6,6 +6,8 @@ from schemas.validation import (
     FieldRuleIn,
     RegexGenerateRequest,
     RegexGenerateResponse,
+    RunDetailOut,
+    RunFieldOut,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "FieldRuleIn",
     "RegexGenerateRequest",
     "RegexGenerateResponse",
+    "RunDetailOut",
+    "RunFieldOut",
 ]

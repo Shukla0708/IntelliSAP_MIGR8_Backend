@@ -54,9 +54,9 @@ def _get_owned_project(project_id: uuid.UUID, db: Session, current_user: User) -
 
 
 def _list_status(status: str | None) -> str:
-    if status in ("completed", "failed", "running"):
+    if status in ("draft", "rules_configured", "running", "completed", "failed"):
         return status
-    return "running"
+    return "draft"
 
 
 def _merge_error_counts(items: list | None, key_field: str) -> list[tuple[str, int]]:
