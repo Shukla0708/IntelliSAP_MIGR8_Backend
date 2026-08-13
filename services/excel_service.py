@@ -1,7 +1,7 @@
 import io
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from services.rules_engine import validate_cell
+from services.rules_engine import is_empty_raw, normalize_key, validate_cell
 
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 MAX_STORED_EXCEPTIONS = 60
@@ -21,6 +21,9 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
     """
     field_configs: one dict per field, matching ValidationField columns.
 
+    If two or more fields have flag_key, uniqueness is checked on the
+    combined values (composite key), not independently per column.
+
     Returns (annotated_workbook_bytes, stats_dict, exceptions_list).
     Output keeps the same layout/format as the source file, with:
       - failing cells filled red
@@ -32,12 +35,19 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
     ws = wb.active
 
     header = [cell.value for cell in ws[1]]
-    name_to_col = {str(name).strip(): idx for idx, name in enumerate(header) if name}
+    name_to_col = _header_index(header)
     reason_col_idx = len(header)
     ws.cell(row=1, column=reason_col_idx + 1, value="Validation_Failure_Reason")
 
     cfg_by_field = {c["field_name"]: c for c in field_configs}
-    seen_keys_by_field = {c["field_name"]: set() for c in field_configs if c["flag_key"]}
+    key_field_names = [c["field_name"] for c in field_configs if c["flag_key"]]
+    # Two or more key fields = one composite unique constraint, not per-column.
+    composite_keys = len(key_field_names) >= 2
+    seen_keys_by_field = (
+        {} if composite_keys
+        else {c["field_name"]: set() for c in field_configs if c["flag_key"]}
+    )
+    seen_composites: dict[tuple[str, ...], int] = {}
 
     total_rows = valid_rows = invalid_rows = total_errors = critical_errors = 0
     errors_by_field: dict[str, int] = {}
@@ -53,11 +63,11 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
         row_has_error = False
 
         for field_name, cfg in cfg_by_field.items():
-            col_idx = name_to_col.get(field_name)
+            col_idx = _col_index(name_to_col, field_name)
             if col_idx is None:
                 continue
             cell = row[col_idx]
-            seen_keys = seen_keys_by_field.get(field_name, set())
+            seen_keys = None if composite_keys else seen_keys_by_field.get(field_name, set())
             reasons = validate_cell(cell.value, cfg, seen_keys)
 
             if reasons:
@@ -83,6 +93,16 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
                             "error_type": reason,
                             "severity": "error" if is_critical else "warning",
                         })
+
+        if composite_keys:
+            dup_count = _flag_duplicate_composite(
+                row, key_field_names, name_to_col, seen_composites,
+                row_reasons, exceptions, errors_by_field, errors_by_type,
+            )
+            if dup_count:
+                row_has_error = True
+                total_errors += dup_count
+                critical_errors += dup_count
 
         if row_has_error:
             invalid_rows += 1
@@ -122,7 +142,88 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
     return out.getvalue(), stats, exceptions
 
 
+def _header_index(header: list) -> dict[str, int]:
+    """Map header names to 0-based indexes (exact and lowercase)."""
+    mapping: dict[str, int] = {}
+    for idx, name in enumerate(header):
+        if name is None:
+            continue
+        label = str(name).strip()
+        if not label:
+            continue
+        mapping[label] = idx
+        mapping[label.lower()] = idx
+    return mapping
+
+
+def _col_index(name_to_col: dict[str, int], field_name: str) -> int | None:
+    if field_name in name_to_col:
+        return name_to_col[field_name]
+    return name_to_col.get(field_name.lower())
+
+
+def _row_number(row) -> int:
+    for cell in row:
+        if cell is not None:
+            return cell.row
+    return 0
+
+
+def _flag_duplicate_composite(
+    row,
+    key_field_names: list[str],
+    name_to_col: dict[str, int],
+    seen_composites: dict[tuple[str, ...], int],
+    row_reasons: list[str],
+    exceptions: list[dict],
+    errors_by_field: dict[str, int],
+    errors_by_type: dict[str, int],
+) -> int:
+    """Flag a duplicate composite key. Returns the number of new errors (0 if unique)."""
+    parts: list[str] = []
+    key_cells: list[tuple[str, object, str]] = []
+    for field_name in key_field_names:
+        col_idx = _col_index(name_to_col, field_name)
+        if col_idx is None or col_idx >= len(row):
+            return 0
+        cell = row[col_idx]
+        raw = normalize_key(cell.value)
+        parts.append(raw)
+        key_cells.append((field_name, cell, raw))
+
+    # Incomplete keys are already flagged per-cell; uniqueness needs every part.
+    if any(is_empty_raw(p) for p in parts):
+        return 0
+
+    composite = tuple(parts)
+    row_num = _row_number(row)
+    first_row = seen_composites.get(composite)
+    if first_row is None:
+        seen_composites[composite] = row_num
+        return 0
+
+    reason = f"Duplicate composite key value (same as row {first_row})"
+    label = " + ".join(key_field_names)
+    for field_name, cell, raw in key_cells:
+        cell.fill = RED_FILL
+        row_reasons.append(f"{field_name}: {reason}")
+        errors_by_field[field_name] = errors_by_field.get(field_name, 0) + 1
+        errors_by_type["Duplicate"] = errors_by_type.get("Duplicate", 0) + 1
+        if len(exceptions) < MAX_STORED_EXCEPTIONS:
+            exceptions.append({
+                "row_number": row_num,
+                "field_name": field_name,
+                "actual_value": raw,
+                "expected_value": f"Unique composite ({label})",
+                "error_type": reason,
+                "severity": "error",
+            })
+    return len(key_cells)
+
+
 def _expected_label(cfg: dict) -> str:
+    if cfg["flag_key"]:
+        return "Non-empty unique key"
     if cfg["flag_email"]:
         return "Valid email format"
     if cfg["flag_mobile"]:
