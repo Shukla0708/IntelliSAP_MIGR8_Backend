@@ -23,6 +23,54 @@ def _get_owned_run(run_id: uuid.UUID, db: Session, current_user: User) -> Valida
     return run
 
 
+def _list_status(status: str | None) -> str:
+    if status in ("completed", "failed", "running"):
+        return status
+    return "running"
+
+
+@router.get("/")
+def list_runs(
+    project_id: uuid.UUID | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List validation runs across all projects owned by the current user."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    query = (
+        db.query(ValidationRun, ValidationProject)
+        .join(ValidationProject, ValidationRun.project_id == ValidationProject.id)
+        .filter(ValidationProject.user_id == current_user.id)
+    )
+    if project_id is not None:
+        query = query.filter(ValidationRun.project_id == project_id)
+
+    rows = (
+        query.order_by(ValidationRun.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "id": str(run.id),
+            "name": run.name,
+            "records": f"{run.total_records} records",
+            "ranAt": run.ran_at.isoformat() if run.ran_at else None,
+            "status": _list_status(run.status),
+            "errors": run.total_errors or 0,
+            "project_id": str(project.id),
+            "project_name": project.name,
+        }
+        for run, project in rows
+    ]
+
+
 @router.post("/")
 def create_run(
     project_id: uuid.UUID,

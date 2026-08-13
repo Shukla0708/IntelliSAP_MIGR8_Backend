@@ -150,6 +150,7 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
+| GET | `/` | Bearer | Cross-project list for current user; optional `project_id`, `limit`, `offset`; includes `project_id` + `project_name` |
 | POST | `/?project_id=` | Bearer | Body `{ name }` (trimmed, required) → `{ run_id }`; duplicate name in project → **409** |
 | POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3; returns `{ fields }` |
 | PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config |
@@ -158,7 +159,7 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 | GET | `/{run_id}/result` | Bearer | Payload for results page (`runName` = stored name) |
 | GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET |
 
-Ownership: every run/project access checks the JWT user owns the project.
+Ownership: every run/project access checks the JWT user owns the project. Cross-project `GET /api/runs/` never returns another user’s runs.
 
 ---
 
@@ -269,6 +270,11 @@ pytest tests/test_run_names.py -q
 ---
 
 ## Session Log
+
+### 2026-08-13 — Cross-project runs list
+
+- Added `GET /api/runs/` (optional `project_id`, `limit`, `offset`) joining runs → owned projects for the current user; response includes `project_id` / `project_name` for Activity UI.
+- Test: `test_list_runs_across_projects` in `tests/test_run_names.py`.
 
 ### 2026-08-13 — Logout endpoint
 
