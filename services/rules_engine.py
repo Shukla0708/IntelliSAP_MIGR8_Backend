@@ -17,29 +17,57 @@ DATE_FORMATS = (
 )
 
 
-def validate_cell(value, field_cfg: dict, seen_keys: set) -> list[str]:
-    """Returns a list of human-readable failure reasons for a single cell."""
+def normalize_raw(value) -> str:
+    """Stable string form for comparisons (dates, blanks, Excel cells)."""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.isoformat()
+    return "" if value is None else str(value).strip()
+
+
+def normalize_key(value) -> str:
+    """Canonical key form so Excel ints/floats match the same ID (1 and 1.0)."""
+    if isinstance(value, bool):
+        return normalize_raw(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return format(value, "g")
+    return normalize_raw(value)
+
+
+def is_empty_raw(raw: str) -> bool:
+    return raw == "" or raw.lower() in ("null", "n/a", "none")
+
+
+def validate_cell(value, field_cfg: dict, seen_keys: set | None) -> list[str]:
+    """Returns a list of human-readable failure reasons for a single cell.
+
+    Pass seen_keys=None to skip per-field uniqueness (used for composite keys).
+    """
     reasons: list[str] = []
+    print(field_cfg)
 
     # Excel date cells arrive as datetime/date, not "21-05-2024".
     # Normalize early so date + regex checks see a stable string.
-    if isinstance(value, datetime):
-        raw = value.strftime("%Y-%m-%d")
-    elif isinstance(value, date):
-        raw = value.isoformat()
-    else:
-        raw = "" if value is None else str(value).strip()
+    raw = normalize_raw(value)
+    key_raw = normalize_key(value)
 
-    is_empty = raw == "" or raw.lower() in ("null", "n/a", "none")
+    is_empty = is_empty_raw(raw)
 
-    if field_cfg["flag_mandatory"] and is_empty:
+    if field_cfg["flag_key"] and is_empty:
+        reasons.append("Key value is empty")
+    elif field_cfg["flag_mandatory"] and is_empty:
         reasons.append("Mandatory field is empty")
 
     if field_cfg["flag_null"] and raw.lower() in ("null", "n/a"):
         reasons.append("Literal null/N-A value not allowed")
 
     if is_empty:
-        return reasons  # nothing further to check on an empty, non-mandatory cell
+        return reasons  # nothing further to check on an empty cell
 
     dt = field_cfg["data_type"]
     if dt == "int" and not raw.lstrip("-").isdigit():
@@ -97,11 +125,11 @@ def validate_cell(value, field_cfg: dict, seen_keys: set) -> list[str]:
         except re.error:
             pass  # malformed regex should never have been saved, but don't crash the run
 
-    if field_cfg["flag_key"]:
-        if raw in seen_keys:
+    if field_cfg["flag_key"] and seen_keys is not None:
+        if key_raw in seen_keys:
             reasons.append("Duplicate key value")
         else:
-            seen_keys.add(raw)
+            seen_keys.add(key_raw)
 
     return reasons
 

@@ -9,8 +9,8 @@
 | Field | Value |
 | --- | --- |
 | Project name | MIGR8 AI — Validation API |
-| Path | `migr8-validation-package/backend/` |
-| Purpose | Auth + validation runs for the MIGR8 AI frontend (Excel upload, rule config, execute, results, download) |
+| Path | `IntelliSAP_MIGR8_Backend/` |
+| Purpose | Auth, validation runs, field mapping, and project reports for the MIGR8 AI frontend |
 | Status | Hackathon demo-ready |
 | Default port | `8000` |
 | OpenAPI | `http://localhost:8000/docs` |
@@ -21,60 +21,72 @@
 
 | Layer | Choice | Notes |
 | --- | --- | --- |
-| Framework | **FastAPI** `0.115` | Uvicorn |
+| Framework | **FastAPI** `0.115` | Uvicorn with `--reload` for local dev |
 | ORM | **SQLAlchemy** `2.0` | Declarative models in `db/models.py` |
-| DB | **PostgreSQL** | Via `psycopg2-binary`; URL from `.env` |
+| DB | **PostgreSQL** | Via `psycopg2-binary`; URL from `.env` (RDS in deploy) |
 | Auth | **JWT** (`python-jose`) + **bcrypt** (direct; not passlib) | Bearer token |
-| Files | **boto3** → S3, or **local disk** | `STORAGE_BACKEND=auto|local|s3` |
+| Files | **boto3** → S3, or **local disk** | `STORAGE_BACKEND=auto\|local\|s3` |
 | Excel | **openpyxl** | Headers, red-fill failures, reason column |
-| AI rules | **Groq** `llama-3.3-70b-versatile` | Plain English → regex |
-| Config | **pydantic-settings** | Loads `.env` |
+| AI rules / mapping | **AWS Bedrock** Claude Sonnet 5 | Plain English → regex; field-mapping re-rank |
+| Bedrock HTTP | **httpx** | Used when `BEDROCK_ACCESS_KEY` is set (bearer REST) |
+| Embeddings (mapping) | **numpy** + local TF-IDF | No model download; swappable later |
+| Config | **pydantic-settings** | Loads `.env`; `extra="ignore"` for legacy vars |
 | Schemas | **Pydantic v2** | Package under `schemas/` |
-| Python | **3.13 tested on Windows** | Needs `psycopg2-binary>=2.9.11`, `httpx==0.27.2` (Groq compat) |
+| Python | **3.12+ / 3.13** | Needs `psycopg2-binary>=2.9.11` on Windows |
 
 ---
 
 ## Project Structure
 
 ```
-backend/
-├── main.py                 # FastAPI app, CORS, startup create_all, /health
-├── config.py               # Settings from .env
+IntelliSAP_MIGR8_Backend/
+├── main.py                 # FastAPI app, CORS, startup create_all, /health, local file serve
+├── config.py               # Settings from .env (incl. bedrock_region, cors_origins)
 ├── auth.py                 # hash/verify password, JWT, get_current_user
 ├── schema.sql              # Canonical Postgres DDL (preferred over auto-create)
-├── migrations/             # Incremental SQL (apply after schema exists)
+├── migrations/
 │   └── 001_validation_run_names.sql
 ├── requirements.txt
 ├── .env.example
 ├── Project.md              # This file
+├── scripts/
+│   ├── check_aws_access.py      # S3 + Bedrock smoke checks
+│   ├── probe_bedrock_profiles.py  # Try inference profile IDs
+│   ├── test_invoke_model.py       # Minimal Bedrock converse call
+│   ├── test_regex_bedrock.py      # End-to-end regex_generator test
+│   └── apply_run_name_migration.py
 ├── tests/
-│   └── test_project_report.py # GET /api/projects/{id}/report
+│   ├── test_bedrock_llm.py        # Mocked Bedrock regex + mapping tests
+│   ├── test_composite_keys.py     # Composite / single-key uniqueness
+│   ├── test_run_names.py          # Run name uniqueness + list/detail
+│   └── test_project_report.py     # GET /api/projects/{id}/report
 ├── db/
 │   ├── database.py         # engine, SessionLocal, get_db
-│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping
+│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, …
 ├── schemas/
 │   ├── __init__.py         # Re-exports for `from schemas import ...`
 │   ├── auth.py
 │   ├── projects.py
 │   ├── validation.py
-│   └── mapping.py          # ConfirmMappingRequest / ConfirmedFieldIn (mapping)
 │   ├── reports.py
-│   └── validation.py
+│   └── mapping.py
 ├── routers/
 │   ├── auth.py             # /api/auth/*
 │   ├── projects.py         # /api/projects/*
 │   ├── validation.py       # /api/runs/*
 │   └── mapping.py          # /api/mappings/*
 └── services/
+    ├── aws_client.py        # boto3 clients (S3 uses AWS_REGION; Bedrock uses BEDROCK_REGION)
+    ├── bedrock_llm.py       # Bedrock Converse wrapper (boto3 or REST bearer)
     ├── s3_service.py
     ├── excel_service.py
     ├── rules_engine.py
     ├── regex_generator.py
     ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
-    ├── embedding_service.py # local TF-IDF vectorizer, numpy only (mapping)
+    ├── embedding_service.py # Cohere Embed v4 on Bedrock (TF-IDF fallback)
     ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
-    ├── llm_mapping.py       # Groq re-rank + reasoning (mapping)
-    └── datatype_matcher.py  # hardcoded SAP-type compatibility matrix (mapping)
+    ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
+    └── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
 ```
 
 ---
@@ -85,19 +97,26 @@ Copy `.env.example` → `.env`:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | e.g. `postgresql://postgres:pass@localhost:5432/migr8` |
+| `DATABASE_URL` | yes | e.g. `postgresql://user:pass@host:5432/migr8` |
 | `JWT_SECRET` | yes | Signing key for access tokens |
 | `JWT_ALGORITHM` | no | Default `HS256` |
 | `JWT_EXPIRE_MINUTES` | no | Default `1440` (24h) |
-| `AWS_ACCESS_KEY_ID` | for S3 | Can stay `your-key` — then storage uses local disk |
-| `AWS_SECRET_ACCESS_KEY` | for S3 | Same |
-| `AWS_REGION` | no | Default `ap-south-1` |
+| `AWS_ACCESS_KEY_ID` | optional | IAM keys for S3; omit on EC2 to use instance role |
+| `AWS_SECRET_ACCESS_KEY` | optional | Same |
+| `AWS_REGION` | no | Default `ap-south-1` in code — **S3 / RDS region** (e.g. `ap-southeast-2`) |
 | `S3_BUCKET` | no | Default `migr8-ai-validation` |
-| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` |
+| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` — use `s3` on EC2 |
 | `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
-| `GROQ_API_KEY` | for Rule 5 | Checkbox rules work without it; generate-regex needs Groq. Also used for field-mapping LLM re-rank (falls back to embedding-only scoring on failure) |
+| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` — regex + mapping LLM |
+| `BEDROCK_EMBED_MODEL_ID` | no | Default `cohere.embed-v4:0` — field-mapping embeddings |
+| `EMBEDDING_BACKEND` | no | `auto` (Cohere if Bedrock creds) \| `bedrock` \| `local` |
+| `CORS_ORIGINS` | no | Comma-separated frontend origins (add EC2 URL on deploy) |
 
-CORS allows local frontend origins: `http://localhost:3000`, `http://127.0.0.1:3000`, plus common Vite ports `5173` / `4173` (and `:3001`). `localhost` and `127.0.0.1` are different origins — both are listed. Add any deployed frontend URL to `_CORS_ORIGINS` in `main.py`.
+**Important:** `AWS_REGION` and `BEDROCK_REGION` are intentionally separate. S3/RDS can live in `ap-southeast-2` while Bedrock inference profiles like `us.anthropic.claude-sonnet-5` must be called via `us-east-1`.
+
+`config.py` uses `extra="ignore"` so legacy keys (e.g. `GROQ_API_KEY`) in `.env` do not crash startup.
+
+CORS origins are read from `CORS_ORIGINS`. Default includes common localhost ports. On EC2, add your frontend URL.
 
 ---
 
@@ -115,35 +134,41 @@ users 1──* validation_projects 1──* validation_runs
 | Table | Role |
 | --- | --- |
 | `users` | Register / login; JWT `sub` = user id |
-| `validation_projects` | Scopes “previous runs” list; FK for runs |
+| `validation_projects` | Scopes runs per user |
 | `validation_runs` | One upload → configure → execute cycle + aggregate stats; **`name` VARCHAR(120) NOT NULL**, unique per `(project_id, name)` |
 | `validation_fields` | Per-column rule flags/config for a run |
-| `validation_exceptions` | Capped failure samples (~60) for results UI |
-| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping"; stores the chosen `number_range_type` (`internal`\|`external`) |
-| `mapping_temp` | One row per source field; `key_field` carries over the source file's Key Field flag; `mapping` JSONB holds its top-3 (or, for internal-number-range key fields, the full target catalog) SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
-| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row; `key` carries over `mapping_temp.key_field` at confirm time |
+| `validation_exceptions` | Capped failure samples for results UI |
+| `mappings` | Source+target upload → embed → LLM-rank cycle |
+| `mapping_temp` | Top-3 SAP candidates per source field (JSONB) |
+| `final_mapping` | User-confirmed mappings; `(mapping_id, source_field)` unique |
 
-**Run status:** `draft` → `rules_configured` → `running` → `completed` | `failed`
-**Mapping status:** `processing` → `completed` | `failed` (pipeline-only; confirmation is tracked separately by the presence of `final_mapping` rows, not a status value)
+**Run status:** `draft` → `rules_configured` → `running` → `completed` \| `failed`
 
-**Run names:** User-provided at create time (trimmed, non-empty, ≤120 chars). No default like `"New validation run"`. Duplicate names within the same project → HTTP 409; the same name is allowed across different projects.
+**Mapping status:** `processing` → `completed` \| `failed`
+
+**Run names:** User-provided at create (trimmed, non-empty, ≤120 chars). Duplicate within project → HTTP 409.
 
 **S3 keys:**
 
 - Source: `validations/{run_id}/source/{filename}`
 - Result: `validations/{run_id}/result/{filename}`
 
-Prefer applying `schema.sql` in pgAdmin/`psql`. On startup, `Base.metadata.create_all` also creates missing tables (hackathon shortcut; weaker constraints than SQL). For existing databases that still have `run_name` / the old default, apply:
+Prefer applying `schema.sql` in pgAdmin/`psql`. On startup, `Base.metadata.create_all` also creates missing tables (hackathon shortcut).
 
 ```bash
-psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql
+psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql   # existing DBs with run_name
 ```
-
-That migration renames `run_name` → `name`, backfills duplicate `"New validation run"` rows to unique names, drops the default, and adds `UNIQUE (project_id, name)`.
 
 ---
 
 ## API map
+
+### Health & local files
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| GET | `/health` | no | `{ status, storage, llm, model, bedrock_region }` |
+| GET | `/api/local-files/{key:path}` | no | Serves files from `local_storage/` when `storage=local` |
 
 ### Auth — `/api/auth`
 
@@ -152,16 +177,16 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
 | POST | `/register` | no | `fullName`, `email`, `password` | `{ token, user }` |
 | POST | `/login` | no | `email`, `password` | `{ token, user }` |
 | GET | `/me` | Bearer | — | `UserOut` |
-| POST | `/logout` | Bearer | Stateless JWT ack; client discards token | `{ message, userId }` |
+| POST | `/logout` | Bearer | Stateless JWT ack | `{ message, userId }` |
 
 ### Projects — `/api/projects`
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | POST | `/` | Bearer | `{ name }` → `ProjectOut` |
-| GET | `/` | Bearer | List current user’s projects |
-| GET | `/{project_id}/runs` | Bearer | Runs list shaped for frontend cards (`id`, `name`, `records`, `ranAt`, `status`, `errors`) |
-| GET | `/{project_id}/report` | Bearer | Aggregated validation KPIs for project report screen (`ProjectReportOut`) |
+| GET | `/` | Bearer | List current user's projects |
+| GET | `/{project_id}/runs` | Bearer | Runs list for project cards |
+| GET | `/{project_id}/report` | Bearer | Aggregated validation KPIs (`ProjectReportOut`) |
 
 ### Field mapping — `/api/mappings`
 
@@ -199,6 +224,11 @@ That migration renames `run_name` → `name`, backfills duplicate `"New validati
   ]
 }
 ```
+| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` → pipeline → `mapping_temp` |
+| GET | `/{run_id}/result` | Bearer | Re-fetch mapping result JSON |
+| POST | `/{run_id}/confirm` | Bearer | Body `{ fields: [{ sourceField, targetField }] }` → upsert `final_mapping` |
+
+**Source file** columns: Field Name, Description, Key Field flag, Datatype. **Target file**: SAP Table, SAP Field, Description, Table Description, Datatype (aliases in `file_parser.py`).
 
 Ownership: every run/project access checks the JWT user owns the project.
 
@@ -206,17 +236,15 @@ Ownership: every run/project access checks the JWT user owns the project.
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| GET | `/` | Bearer | Cross-project list for current user; optional `project_id`, `limit`, `offset`; includes `project_id` + `project_name`; returns real statuses (`draft`, `rules_configured`, etc.) |
-| POST | `/?project_id=` | Bearer | Body `{ name }` (trimmed, required) → `{ run_id }`; duplicate name in project → **409** |
-| GET | `/{run_id}` | Bearer | Run detail for draft edit UI: `name`, `status`, `source_filename`, `has_source_file`, `fields[]` with rule config |
-| POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3; returns `{ fields }` |
-| PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config |
-| POST | `/generate-regex` | Bearer | `{ field_name, prompt }` → `{ regex }` |
+| GET | `/` | Bearer | Cross-project list; optional `project_id`, `limit`, `offset` |
+| POST | `/?project_id=` | Bearer | Body `{ name }` → `{ run_id }`; duplicate → **409** |
+| GET | `/{run_id}` | Bearer | Draft edit UI: `name`, `status`, `fields[]`, `has_source_file` |
+| POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3/local; returns `{ fields }` |
+| PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config; re-generates regex from `regex_prompt` when set |
+| POST | `/generate-regex` | Bearer | `{ field_name, prompt }` → `{ regex }`; failure → **422** `{ message, reason }` |
 | POST | `/{run_id}/execute` | Bearer | Sync validation; updates stats + exceptions |
-| GET | `/{run_id}/result` | Bearer | Payload for results page (`runName` = stored name) |
-| GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET |
-
-Ownership: every run/project access checks the JWT user owns the project. Cross-project `GET /api/runs/` never returns another user’s runs.
+| GET | `/{run_id}/result` | Bearer | Payload for results page |
+| GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET (or local URL) |
 
 ---
 
@@ -227,37 +255,55 @@ Ownership: every run/project access checks the JWT user owns the project. Cross-
 Per-cell checks driven by field config:
 
 - Mandatory / literal null-N/A
-- Data type: int, decimal, boolean, string/char
+- Data types: int, decimal, boolean, string/char
 - Max length, decimal precision
 - Case: uppercase / lowercase / camelCase
 - Email, mobile, date formats, special chars
-- Custom regex via **`re.fullmatch`** (entire cell must match)
-- Key uniqueness (in-run `seen_keys` set)
+- Custom regex via **`re.fullmatch`**
+- Single-column key uniqueness (`seen_keys` set per field)
 
-**Dates (Excel-aware):** openpyxl returns real `datetime`/`date` objects for date cells (not `"21-05-2024"` text). Those objects are accepted as valid dates. String values still accept `%Y-%m-%d`, `%d-%m-%Y`, `%m/%d/%Y`, `%d/%m/%Y` (plus datetime string forms). Date separators (`-` / `/`) are not treated as disallowed special characters when the value is a valid date. For regex on date cells, common display forms (`YYYY-MM-DD`, `DD-MM-YYYY`, etc.) are tried so a DD-MM pattern can still pass an Excel date cell.
+**Key normalization:** `normalize_key()` treats Excel `1` and `1.0` as the same key.
 
-### `excel_service`
+**Dates (Excel-aware):** Accepts `datetime`/`date` objects from openpyxl plus string formats (`%Y-%m-%d`, `%d-%m-%Y`, `%m/%d/%Y`, `%d/%m/%Y`, `%Y%m%d`, `%d%m%y`, etc.). Date separators are not flagged as special chars when the value is a valid date.
 
-- `extract_headers` — row 1 → column names for the rules table
-- `run_validation` — annotate workbook: red fill on failing cells, append `Validation_Failure_Reason`, return stats + up to 60 exceptions
+### `excel_service.run_validation`
+
+- **`extract_headers`** — row 1 → column names for the rules UI
+- **`run_validation`** — annotate workbook (red fill, `Validation_Failure_Reason` column), return stats + exceptions
+
+**Composite keys:** When **two or more** fields have `flag_key`, uniqueness is enforced on the **combined** tuple (e.g. `CustomerID + OrderID`), not per column. Duplicate pairs flag all key columns with `Duplicate composite key value (same as row N)`.
+
+**Exception sampling:** At most **5 rows per error type** and **20 total** stored (`MAX_EXCEPTIONS_PER_TYPE`, `MAX_STORED_EXCEPTIONS`) so one noisy error does not hide others.
 
 ### `regex_generator`
 
-**Always LLM-driven (hackathon Rule 5):** Groq `llama-3.3-70b-versatile` turns plain English → JSON `{"regex":"..."}`. Pattern is compiled before return; stray `^`/`$` anchors are stripped because the engine uses `re.fullmatch`. System prompt includes few-shot examples (e.g. `"starts with H4"` → `H4.*`) so the model rejects values that break the rule.
+Bedrock Claude Sonnet 5 via `bedrock_llm.chat()` → JSON `{"regex":"..."}`. Strips `^`/`$` (engine uses `fullmatch`). On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, Bedrock regenerates `regex` (Rule 5 stays LLM-driven even if UI Generate was skipped). Falls back to client-supplied `regex` on failure.
 
-On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq again and stores the resulting `regex` (so Rule 5 stays LLM-backed even if the UI Generate button was skipped). Falls back to any client-supplied `regex` if generation fails.
+### `bedrock_llm`
+
+- **Auth path A:** `BEDROCK_ACCESS_KEY` set → REST `POST …/converse` with `Authorization: Bearer …` (httpx)
+- **Auth path B:** No API key → boto3 `bedrock-runtime` client (IAM keys or instance role)
+- Uses **`BEDROCK_REGION`** for the endpoint (not `AWS_REGION`)
+- **Claude Sonnet 5 quirks:** no `temperature` in `inferenceConfig`; responses may include `reasoningContent` blocks before the text — parser collects all `text` blocks
+- `strip_markdown_fences()` for JSON cleanup
+
+### `aws_client`
+
+- S3 client → `AWS_REGION` + optional IAM keys; `certifi` for SSL on Windows
+- Bedrock client → `BEDROCK_REGION`; sets `AWS_BEARER_TOKEN_BEDROCK` when API key is configured
+- Placeholder keys (`your-key`, `changeme`, etc.) treated as unset
 
 ### `s3_service`
 
-`upload_bytes` / `download_bytes` / `presigned_url` — uses S3 when real AWS keys are set; otherwise **local disk** under `local_storage/` (`STORAGE_BACKEND=auto`).
+`upload_bytes` / `download_bytes` / `presigned_url` / `storage_mode()`. `STORAGE_BACKEND=auto` uses local disk under `local_storage/` when AWS keys are placeholders.
 
-### `file_parser` (mapping)
+### Mapping services
 
 `parse_source_fields` / `parse_target_fields` — read `.csv` or `.xlsx`, match fixed headers case-insensitively (with a small alias list per column), return one dict per row. Raises `ValueError` (→ HTTP 422) if a required column isn't found or the file has no data rows. Source rows: `field_name`, `description`, `key_field` (bool, normalized from `Y/N`/`X`/`TRUE/FALSE`/`1/0`/`yes/no`), `datatype`. Target rows: `sap_table`, `sap_field`, `description`, `table_description`, `datatype`.
 
 ### `embedding_service` (mapping)
 
-`embed_texts(list[str]) -> np.ndarray` — local character-trigram + word-bigram TF-IDF vectorizer, numpy only, no model download. Swap target: **fastembed** (`BAAI/bge-small-en-v1.5`) or **Cohere Embed v4** (`cohere.embed-v4:0`) — same function signature.
+`embed_texts(list[str]) -> np.ndarray` — **Cohere Embed v4** on Bedrock (`BEDROCK_EMBED_MODEL_ID`, default `cohere.embed-v4:0`) via InvokeModel, same creds as Claude (`BEDROCK_ACCESS_KEY` or IAM). Batches of 96. L2-normalized rows. Falls back to local TF-IDF when `EMBEDDING_BACKEND=local` or no Bedrock credentials.
 
 ### `mapping_engine` (mapping)
 
@@ -265,7 +311,7 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 
 ### `llm_mapping` (mapping)
 
-`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to Groq (`llama-3.3-70b-versatile`), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run. Swap target: **Claude Sonnet 4.5 / Sonnet 5 via Bedrock** — same function signature.
+`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to **Bedrock** (`BEDROCK_MODEL_ID`, default Claude Sonnet 5), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run.
 
 ### `datatype_matcher` (mapping)
 
@@ -277,27 +323,26 @@ On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, the backend calls Groq a
 
 | Module | Models |
 | --- | --- |
-| `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` — email is plain `str` with simple `@` / domain checks (not strict `EmailStr`) |
-| `projects.py` | `ProjectCreate`, `ProjectOut` — `id` always serialized as `str` (UUID coerced) |
-| `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc. — project report aggregation |
-| `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest`, `RegexGenerateResponse` |
-| `mapping.py` | `ConfirmedFieldIn` (`source_field`, `target_field`), `ConfirmMappingRequest` (`fields: list[ConfirmedFieldIn]`) — body for `POST /{run_id}/confirm` |
+| `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` |
+| `projects.py` | `ProjectCreate`, `ProjectOut` — `id` serialized as `str` |
+| `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, … |
+| `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest/Response`, `RunDetailOut`, `RunFieldOut` |
+| `mapping.py` | `ConfirmedFieldIn`, `ConfirmMappingRequest` |
 
-Routers import via `from schemas import ...` (`schemas/__init__.py` re-exports).
+Routers import via `from schemas import ...`.
 
 ---
 
 ## Local run
 
 ```bash
-cd backend
+cd IntelliSAP_MIGR8_Backend
 python -m venv venv
 # Windows:
 .\venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env   # fill values
 
-# Option A: auto-create tables on startup
 uvicorn main:app --reload --port 8000
 
 # Option B: apply schema.sql first, then uvicorn
@@ -313,43 +358,44 @@ uvicorn main:app --reload --port 8000
 
 Smoke checks:
 
-- `GET /health` → `{"status":"ok"}`
-- Swagger: `/docs` → register → login → create project → create run with `{ name }` → upload
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","storage":"local|s3","llm":"bedrock","model":"us.anthropic.claude-sonnet-5","bedrock_region":"us-east-1"}
+
+python scripts/test_regex_bedrock.py   # needs BEDROCK_ACCESS_KEY or IAM Bedrock access
+```
 
 Tests (needs Postgres + `.env`):
 
 ```bash
-pytest tests/test_run_names.py -q
+pytest tests/ -q
 ```
 
 ---
 
 ## Decisions & Conventions
 
-1. **Bearer JWT in Authorization header** — no cookie session yet.
-2. **CamelCase in auth JSON** (`fullName`) to match frontend forms; field rules use snake_case on the wire.
-3. **Sync execute** for demo size; large files should move to a queue + poll `status`.
-4. **`schema.sql` is source of truth** for production-like constraints; SQLAlchemy models power the app + optional auto-create.
-5. **Never log secrets** from `.env`; keep `.env` out of git.
+1. **Bearer JWT** in `Authorization` header — no server-side session store.
+2. **CamelCase in auth JSON** (`fullName`); field rules use snake_case on the wire.
+3. **Sync execute** for demo-sized files; large files should move to a background job.
+4. **`schema.sql` is source of truth** for constraints; SQLAlchemy `create_all` is a hackathon shortcut.
+5. **Never log secrets** from `.env`.
 6. Keep routers thin; business logic in `services/`.
-7. **Hash passwords with `bcrypt` directly** — avoid passlib + bcrypt 5.x wrap-bug crash on Windows/Python 3.13.
-8. **Always `str(uuid)` in API response models** — FastAPI response validation rejects raw `UUID` when the schema field is `str` (see `ProjectOut` / projects router).
-9. **Storage:** `STORAGE_BACKEND=auto` uses local disk when AWS keys are placeholders; set real keys + `s3` for cloud.
-10. **Rule 5 is LLM-only** — no deterministic regex shortcuts; Groq generates every custom pattern from plain English.
-11. **Date cells from Excel are typed values** — never rely on `str(datetime)` alone for format checks.
-12. **Validation run `name` is user-supplied and unique per project** — trim on input; empty → 422; unique violation → 409 with a stable detail message.
-13. **Embedding/LLM providers are behind stable function signatures on purpose** — `embedding_service.embed_texts()` (local TF-IDF now → fastembed/Cohere Embed v4 later) and `llm_mapping.rank_candidates()` (Groq now → Claude via Bedrock later) so swapping providers doesn't touch `mapping_engine`/`routers/mapping.py`.
-14. **`mapping_temp`/`final_mapping` are intentionally minimal** — `mapping_temp` stores `id`, `mapping_id`, `source_field`, `key_field`, `mapping` (JSONB candidates); `final_mapping` stores `id`, `mapping_id`, `source_field`, `target_field`, `key`. `sourceDescription` isn't persisted anywhere post-pipeline, and `final_mapping` carries no scores/reasoning/timestamps beyond the `key` flag.
-15. **Mapping confirmation is per-field, not per-run** — `POST /{run_id}/confirm` accepts a list of `{source_field, target_field}` pairs and upserts one `final_mapping` row per field (unique on `(mapping_id, source_field)`); re-confirming a field overwrites its previous choice rather than duplicating.
-16. **`number_range_type` gates AI pre-mapping for key fields, not the whole run** — only rows where `mapping_temp.key_field` is true are affected by `"internal"` vs `"external"`; non-key rows always go through the normal ranked pipeline.
+7. **bcrypt directly** — avoid passlib + bcrypt 5.x issues on Windows.
+8. **Always `str(uuid)` in API responses** when schema field is `str`.
+9. **`AWS_REGION` ≠ `BEDROCK_REGION`** — S3/RDS region vs Bedrock inference profile endpoint.
+10. **Rule 5 is LLM-only** — Bedrock generates every custom regex from plain English.
+11. **Composite keys** — ≥2 `flag_key` fields → tuple uniqueness, not per-column.
+12. **Exception cap** — diverse error types in UI despite many failures in the file.
+13. **Bedrock API key vs IAM** — API key uses httpx REST; IAM uses boto3. S3 always uses IAM keys/role.
+14. **Mapping confirmation is per-field** — upsert on `(mapping_id, source_field)`.
 
 ---
 
 ## Open Questions / TBD
 
-- Background job for `execute` (Celery / RQ / FastAPI BackgroundTasks)
+- Background job for `execute` (Celery / RQ / BackgroundTasks)
 - Password reset
-- Project switcher UI (backend already supports multiple projects)
 - Stricter alignment of auto-created tables with `schema.sql` CHECKs
 - Server-side auth (httpOnly cookie) so results can SSR — frontend currently uses Bearer + readable cookie for middleware
 - Drop unused `passlib` from `requirements.txt` once confirmed unused
@@ -357,6 +403,10 @@ pytest tests/test_run_names.py -q
 - Field mapping: "Fetch from SAP" live target-table lookup isn't implemented — target field list is upload-only for now
 - Field mapping: `datatype_match_score` uses a hardcoded compatibility matrix (`services/datatype_matcher.py`); revisit if SAP type coverage needs to grow
 - Field mapping: `GET /{run_id}/result` now surfaces `confirmedTargetField` per row (read-only), but there's still no endpoint to un-confirm/delete a single `final_mapping` row — only upsert via `/confirm`
+- Remove unused `groq` / `passlib` from `requirements.txt` once venv is rebuilt
+- Field mapping: batch multiple source fields per LLM call for large files
+- Field mapping: list/edit confirmed `final_mapping` rows endpoint
+- Drop debug `print` in `rules_engine.validate_cell` before production
 
 ---
 
@@ -370,74 +420,62 @@ pytest tests/test_run_names.py -q
 - No breaking change to `POST /{run_id}/confirm`'s contract — it now also copies `mapping_temp.key_field` into `final_mapping.key` on upsert.
 
 ### 2026-08-13 — Field mapping feature (source → SAP target)
+### 2026-08-13 — Bedrock region + API key + Sonnet 5 response parsing
 
-- New router `routers/mapping.py`: `POST /api/mappings/?project_id=` (multipart `source_file` + `target_file`) runs parse → embed → top-3 → LLM re-rank synchronously and persists one `mapping_temp` row per source field (JSONB array of candidates); `GET /{run_id}/result` re-fetches it; `POST /{run_id}/confirm` validates and upserts confirmed picks into `final_mapping`.
-- New services: `file_parser` (adds Key Field flag + Datatype to source uploads, Table Description + Datatype to target uploads), `embedding_service` (local TF-IDF, numpy only), `mapping_engine` (cosine top-3 + datatype match score), `llm_mapping` (Groq re-rank + reasoning), `datatype_matcher` (hardcoded SAP-type compatibility matrix).
-- Response gained `datatypeMatchScore` per candidate and `mappedFields` on the run; `sourceDescription` is intentionally not persisted (dropped from `mapping_temp`'s minimal column set).
-- Added `numpy==1.26.4` to `requirements.txt`.
-### 2026-08-13 — Validation run detail + real list statuses
+- Added `BEDROCK_REGION` (default `us-east-1`) separate from `AWS_REGION` for S3/RDS.
+- `BEDROCK_ACCESS_KEY` (`ABSK…`) → httpx REST with bearer token; IAM path unchanged via boto3.
+- `bedrock_llm`: omit deprecated `temperature`; parse `reasoningContent` + `text` blocks from Sonnet 5.
+- `/health` returns `bedrock_region`, `storage`, `llm`, `model`.
+- Scripts: `test_regex_bedrock.py`, `probe_bedrock_profiles.py`, `check_aws_access.py`.
+- `generate-regex` returns **422** with `{ message, reason }` on failure.
 
-- List endpoints (`GET /api/runs/`, `GET /api/projects/{id}/runs`) now return real `draft` / `rules_configured` statuses instead of mapping them to `running`.
-- Test: `test_get_run_detail` in `tests/test_run_names.py`.
+### 2026-08-13 — Composite key validation
 
-### 2026-08-13 — Cross-project runs list
+- `excel_service`: when ≥2 fields have `flag_key`, enforce composite uniqueness across the row tuple.
+- `normalize_key()` matches Excel int/float (`1` vs `1.0`).
+- Exception sampling: max 5 per error type, 20 total stored.
+- Tests: `tests/test_composite_keys.py`.
 
-- Added `GET /api/runs/` (optional `project_id`, `limit`, `offset`) joining runs → owned projects for the current user; response includes `project_id` / `project_name` for Activity UI.
-- Test: `test_list_runs_across_projects` in `tests/test_run_names.py`.
+### 2026-08-13 — Field mapping feature
 
-### 2026-08-13 — Project report endpoint
+- Router `routers/mapping.py`: parse → embed → top-3 → Bedrock re-rank → `mapping_temp` / `final_mapping`.
+- Services: `file_parser`, `embedding_service`, `mapping_engine`, `llm_mapping`, `datatype_matcher`.
 
-- Added `GET /api/projects/{project_id}/report` — aggregates validation run stats for the frontend `/report` screen.
-- New `schemas/reports.py` with `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, etc.
-- Tests: `tests/test_project_report.py` (empty report, 404 for non-owner).
+### 2026-08-13 — Bedrock LLM migration (Groq removed from code)
 
-### 2026-08-13 — Logout endpoint
-- Added `POST /api/auth/logout` (Bearer required). Confirms session; client clears JWT (stateless).
+- `services/bedrock_llm.py` for regex + mapping; default `us.anthropic.claude-sonnet-5`.
+- `services/aws_client.py` for IAM-role-aware boto3.
+- Tests: `tests/test_bedrock_llm.py` (mocked).
 
-### 2026-08-13 — Frontend consumes JWT (no API change)
+### 2026-08-13 — Project report + cross-project runs + run names
 
-- Next.js frontend now stores login/register `token`, sends `Authorization: Bearer`, and guards routes with cookie + `GET /api/auth/me`.
-- Auth contract unchanged: `POST /api/auth/login|register` → `{ token, user }`, `GET /api/auth/me`.
-### 2026-08-13 — Unique user-provided validation run names
+- `GET /api/projects/{project_id}/report` — `schemas/reports.py`, `tests/test_project_report.py`.
+- `GET /api/runs/` — cross-project activity list with `project_id` / `project_name`.
+- Validation run `name` unique per project; migration `001_validation_run_names.sql`.
 
-- Renamed `validation_runs.run_name` → `name` (`VARCHAR(120) NOT NULL`, no default).
-- Added `UNIQUE (project_id, name)` in `schema.sql` + SQLAlchemy model.
-- Migration `migrations/001_validation_run_names.sql` backfills duplicate `"New validation run"` rows, then applies NOT NULL + unique.
-- `POST /api/runs/?project_id=` accepts `{ name }`; trim/empty → 422; conflict → 409 `"A validation run with this name already exists in this project"`.
-- List/result responses keep existing shapes; `name` / `runName` now reflect the stored user name.
-- Tests: `tests/test_run_names.py` (create, same-project 409, cross-project allowed, empty 422).
+### 2026-08-13 — Logout + auth
 
-### 2026-08-12 — Windows / Python 3.13 runtime fixes + ProjectOut UUID
+- `POST /api/auth/logout` — client clears JWT (stateless).
 
-- Bumped `psycopg2-binary` to `2.9.11` (wheels for cp313 Windows).
-- Added `email-validator`, pinned `httpx==0.27.2` (Groq 0.11 incompatible with httpx 0.28 `proxies` kwarg).
-- Replaced passlib hashing with direct `bcrypt` (`auth.py`); pin `bcrypt==4.0.1`.
-- Relaxed register/login email validation (no strict `EmailStr`).
-- Fixed `GET/POST /api/projects/` 500: coerce project `id` UUID → `str` in router/`ProjectOut`.
-- Confirmed upload fails with `InvalidAccessKeyId` until real `AWS_*` / bucket are set in `.env`.
+### 2026-08-12 — Windows / Python 3.13 fixes
 
-### 2026-08-12 — Schemas package
+- `psycopg2-binary` 2.9.11, direct bcrypt, `ProjectOut` UUID → str coercion.
+- Schemas split into `schemas/` package.
 
-- Split flat `schemas.py` into `schemas/{auth,projects,validation}.py` + `__init__.py` re-exports.
-- Router imports unchanged: `from schemas import ...`.
+### 2026-08-13 — Date validation + regex hardening
 
-### 2026-08-12 — Project.md added
-
-- Documented stack, structure, env, data model, API map, services, run instructions.
-
-### 2026-08-13 — Date validation + LLM regex hardening
-
-- **Dates:** Excel `datetime`/`date` cells no longer fail as “Invalid date format” (was caused by `str(value)` → `"2024-05-21 00:00:00"`). Accept typed dates; keep string format list; skip special-char flag for valid date separators.
-- **Regex engine:** switched custom-rule matching from `re.match` → `re.fullmatch`; try multiple date string forms for regex on Excel date cells.
-- **Groq Rule 5:** stronger system prompt + few-shot examples; strip `^`/`$` from model output. On save rules, re-generate `regex` from `regex_prompt` via Groq when a prompt is present (LLM remains the only generator — no deterministic bypass).
-- **Repo:** backend published to https://github.com/Shukla0708/migr8-AI-backend
+- Excel `datetime`/`date` cells accepted; `re.fullmatch` for regex rules.
+- Repo: https://github.com/Shukla0708/migr8-AI-backend
 
 ---
 
 ## Change Checklist
 
-- [x] New dependency — `pytest==8.3.3`
-- [x] New route or response shape — `POST /api/runs/` body `{ name }`; 409 on duplicate
-- [x] Model / `schema.sql` change — `name` + unique `(project_id, name)`; migration `001`
+When you change the backend, update this file if you touch:
+
+- [ ] New dependency in `requirements.txt`
+- [ ] New route or response shape
+- [ ] Model / `schema.sql` change (+ migration if needed)
 - [ ] New env var / `.env.example`
-- [x] Service behavior change (rules, Excel, S3, Groq) — 2026-08-13 date + LLM regex
+- [ ] Service behavior (rules, Excel, S3, Bedrock)
+- [ ] Test file added or renamed

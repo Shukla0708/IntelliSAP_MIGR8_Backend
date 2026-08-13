@@ -1,10 +1,6 @@
 import json
-from groq import Groq
-from config import settings
 
-# Groq for now; swap for Claude Sonnet 4.5 / Sonnet 5 via Bedrock later by
-# replacing rank_candidates()'s body while keeping its signature.
-client = Groq(api_key=settings.groq_api_key)
+from services import bedrock_llm
 
 SYSTEM_PROMPT = (
     "You are an SAP data migration expert who maps legacy source fields to SAP "
@@ -37,17 +33,12 @@ def rank_candidates(source_field: str, source_description: str | None, candidate
         } for c in candidates],
     }
 
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ],
-        temperature=0,
+    raw = bedrock_llm.chat(
+        SYSTEM_PROMPT,
+        json.dumps(user_payload),
         max_tokens=600,
     )
-    raw = resp.choices[0].message.content.strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    raw = bedrock_llm.strip_markdown_fences(raw)
     ranked = json.loads(raw)
 
     by_key = {(c["sap_table"], c["sap_field"]): c for c in candidates}
@@ -55,7 +46,7 @@ def rank_candidates(source_field: str, source_description: str | None, candidate
     for r in ranked:
         base = by_key.get((r["sap_table"], r["sap_field"]))
         if base is None:
-            continue  # LLM hallucinated a table/field we never offered it
+            continue
         out.append({
             "sap_table": r["sap_table"],
             "sap_field": r["sap_field"],

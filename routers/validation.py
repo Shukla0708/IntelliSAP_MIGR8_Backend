@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
@@ -18,6 +19,7 @@ from schemas import (
 )
 
 router = APIRouter(prefix="/api/runs", tags=["validation"])
+logger = logging.getLogger(__name__)
 
 
 def _get_owned_run(run_id: uuid.UUID, db: Session, current_user: User) -> ValidationRun:
@@ -197,7 +199,7 @@ def save_rules(run_id: uuid.UUID, payload: list[FieldRuleIn], db: Session = Depe
         row.max_length = f.max_length
         row.decimal_length = f.decimal_length
         row.regex_prompt = f.regex_prompt
-        # If the user wrote a plain-English rule, always ask Groq for the regex
+        # If the user wrote a plain-English rule, always ask Bedrock for the regex
         # so Rule 5 stays LLM-driven even if they didn't click Generate in the UI.
         if f.regex_prompt and f.regex_prompt.strip():
             try:
@@ -217,8 +219,20 @@ def generate_regex_route(payload: RegexGenerateRequest, current_user: User = Dep
     try:
         regex = regex_generator.generate_regex(payload.field_name, payload.prompt)
         return RegexGenerateResponse(regex=regex)
-    except Exception:
-        raise HTTPException(422, "Could not generate a valid rule from that prompt. Try rephrasing it.")
+    except Exception as exc:
+        logger.exception(
+            "generate-regex failed for field=%r prompt=%r",
+            payload.field_name,
+            payload.prompt,
+        )
+        detail = str(exc).strip() or "Could not generate a valid rule from that prompt."
+        raise HTTPException(
+            422,
+            detail={
+                "message": "Could not generate a valid rule from that prompt. Try rephrasing it.",
+                "reason": detail,
+            },
+        )
 
 
 @router.post("/{run_id}/execute")
