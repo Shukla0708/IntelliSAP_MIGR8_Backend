@@ -50,6 +50,20 @@ def test_prefilter_refuses_off_topic():
     assert chat_service._prefilter("hi", []) is not None
 
 
+def test_humanize_reply_turns_table_into_bullets():
+    raw = (
+        "The two most common errors are tied.\n"
+        "| Type | Count |\n"
+        "|---|---|\n"
+        "| Exceeds max length | 40 |\n"
+        "| Does not match rule | 40 |\n"
+    )
+    text = chat_service._humanize_reply(raw)
+    assert "|" not in text
+    assert "• Type: Exceeds max length · Count: 40" in text
+    assert "tied" in text
+
+
 def test_prefilter_allows_domain_questions():
     assert chat_service._prefilter("duplicate key errors in last validation run", []) is None
     assert chat_service._prefilter("why is CUSTOMER_ID failing?", []) is None
@@ -85,9 +99,18 @@ def test_context_pack_includes_latest_run(db, auth_user):
     ))
     db.commit()
 
+    other = ValidationProject(user_id=user.id, name="Second Project")
+    db.add(other)
+    db.commit()
+
     pack = chat_service.build_context_pack(
         db, user, ChatContextIn(page="dashboard", project_id=str(project.id))
     )
+    assert pack["scope"] == "all_projects"
+    names = {p["name"] for p in pack["projects"]}
+    assert names == {"Chat Project", "Second Project"}
+    chat_summary = next(p for p in pack["projects"] if p["name"] == "Chat Project")
+    assert chat_summary["latestValidation"]["name"] == "Sales check"
     latest = pack["latestCompletedValidationRun"]
     assert latest["name"] == "Sales check"
     assert latest["exceptionSample"][0]["field"] == "CustomerID"
