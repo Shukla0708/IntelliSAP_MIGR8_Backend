@@ -119,3 +119,22 @@ def test_single_key_still_independent():
     )
     assert stats["invalid_rows"] == 1
     assert any(e["error_type"] == "Duplicate key value" for e in exceptions)
+
+
+def test_exceptions_cap_per_type_and_keep_other_types():
+    """Many empty-key rows must not crowd out later email errors."""
+    from services.excel_service import MAX_EXCEPTIONS_PER_TYPE, MAX_STORED_EXCEPTIONS
+
+    rows = [[None, f"user{i}@ok.com"] for i in range(12)]
+    rows += [[f"id-{i}", "not-an-email"] for i in range(8)]
+    data = _xlsx(["CustomerID", "Email"], rows)
+    _, stats, exceptions = run_validation(
+        data,
+        [_cfg("CustomerID", True), {**_cfg("Email"), "flag_email": True}],
+    )
+    empty_rows = {e["row_number"] for e in exceptions if e["error_type"] == "Key value is empty"}
+    email_rows = {e["row_number"] for e in exceptions if e["error_type"] == "Invalid email format"}
+    assert len(empty_rows) == MAX_EXCEPTIONS_PER_TYPE
+    assert len(email_rows) == MAX_EXCEPTIONS_PER_TYPE
+    assert len(exceptions) <= MAX_STORED_EXCEPTIONS
+    assert stats["total_errors"] > len(exceptions)

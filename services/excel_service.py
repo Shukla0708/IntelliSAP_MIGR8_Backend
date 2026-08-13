@@ -4,7 +4,8 @@ from openpyxl.styles import PatternFill
 from services.rules_engine import is_empty_raw, normalize_key, validate_cell
 
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-MAX_STORED_EXCEPTIONS = 60
+MAX_STORED_EXCEPTIONS = 20
+MAX_EXCEPTIONS_PER_TYPE = 5
 
 
 def extract_headers(file_bytes: bytes) -> list[str]:
@@ -25,6 +26,8 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
     combined values (composite key), not independently per column.
 
     Returns (annotated_workbook_bytes, stats_dict, exceptions_list).
+    Exceptions are a mixed sample: at most MAX_EXCEPTIONS_PER_TYPE rows
+    per error type, and at most MAX_STORED_EXCEPTIONS overall.
     Output keeps the same layout/format as the source file, with:
       - failing cells filled red
       - one appended 'Validation_Failure_Reason' column containing the
@@ -53,6 +56,7 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
     errors_by_field: dict[str, int] = {}
     errors_by_type: dict[str, int] = {}
     exceptions: list[dict] = []
+    stored_rows_by_type: dict[str, set[int]] = {}
 
     for row in ws.iter_rows(min_row=2):
         if all(c.value is None for c in row):
@@ -84,20 +88,20 @@ def run_validation(file_bytes: bytes, field_configs: list[dict]):
                     if is_critical:
                         critical_errors += 1
 
-                    if len(exceptions) < MAX_STORED_EXCEPTIONS:
-                        exceptions.append({
-                            "row_number": row[0].row,
-                            "field_name": field_name,
-                            "actual_value": str(cell.value),
-                            "expected_value": _expected_label(cfg),
-                            "error_type": reason,
-                            "severity": "error" if is_critical else "warning",
-                        })
+                    _try_store_exception(exceptions, stored_rows_by_type, {
+                        "row_number": row[0].row,
+                        "field_name": field_name,
+                        "actual_value": str(cell.value),
+                        "expected_value": _expected_label(cfg),
+                        "error_type": reason,
+                        "severity": "error" if is_critical else "warning",
+                    })
 
         if composite_keys:
             dup_count = _flag_duplicate_composite(
                 row, key_field_names, name_to_col, seen_composites,
-                row_reasons, exceptions, errors_by_field, errors_by_type,
+                row_reasons, exceptions, stored_rows_by_type,
+                errors_by_field, errors_by_type,
             )
             if dup_count:
                 row_has_error = True
@@ -162,6 +166,30 @@ def _col_index(name_to_col: dict[str, int], field_name: str) -> int | None:
     return name_to_col.get(field_name.lower())
 
 
+def _exception_type_key(reason: str) -> str:
+    """Group composite-key duplicates as one type regardless of first-row text."""
+    if reason.startswith("Duplicate composite key value"):
+        return "Duplicate composite key value"
+    return reason
+
+
+def _try_store_exception(
+    exceptions: list[dict],
+    stored_rows_by_type: dict[str, set[int]],
+    item: dict,
+) -> None:
+    """Keep a mixed sample: up to N rows per error type, and an overall cap."""
+    if len(exceptions) >= MAX_STORED_EXCEPTIONS:
+        return
+    key = _exception_type_key(item["error_type"])
+    rows = stored_rows_by_type.setdefault(key, set())
+    row_num = item["row_number"]
+    if row_num not in rows and len(rows) >= MAX_EXCEPTIONS_PER_TYPE:
+        return
+    exceptions.append(item)
+    rows.add(row_num)
+
+
 def _row_number(row) -> int:
     for cell in row:
         if cell is not None:
@@ -176,6 +204,7 @@ def _flag_duplicate_composite(
     seen_composites: dict[tuple[str, ...], int],
     row_reasons: list[str],
     exceptions: list[dict],
+    stored_rows_by_type: dict[str, set[int]],
     errors_by_field: dict[str, int],
     errors_by_type: dict[str, int],
 ) -> int:
@@ -209,15 +238,14 @@ def _flag_duplicate_composite(
         row_reasons.append(f"{field_name}: {reason}")
         errors_by_field[field_name] = errors_by_field.get(field_name, 0) + 1
         errors_by_type["Duplicate"] = errors_by_type.get("Duplicate", 0) + 1
-        if len(exceptions) < MAX_STORED_EXCEPTIONS:
-            exceptions.append({
-                "row_number": row_num,
-                "field_name": field_name,
-                "actual_value": raw,
-                "expected_value": f"Unique composite ({label})",
-                "error_type": reason,
-                "severity": "error",
-            })
+        _try_store_exception(exceptions, stored_rows_by_type, {
+            "row_number": row_num,
+            "field_name": field_name,
+            "actual_value": raw,
+            "expected_value": f"Unique composite ({label})",
+            "error_type": reason,
+            "severity": "error",
+        })
     return len(key_cells)
 
 
