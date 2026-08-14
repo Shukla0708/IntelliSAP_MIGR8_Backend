@@ -77,7 +77,7 @@ def answer(db: Session, user: User, payload: ChatRequest) -> ChatResponse:
         f"User question: {message}"
     )
     try:
-        reply = bedrock_llm.chat(SYSTEM_PROMPT, user_prompt, max_tokens=500)
+        reply = bedrock_llm.chat(SYSTEM_PROMPT, user_prompt, max_tokens=1000)
     except Exception as exc:
         raise ValueError(f"Chat model failed: {exc}") from exc
     return ChatResponse(
