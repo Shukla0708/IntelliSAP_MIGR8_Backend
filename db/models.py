@@ -92,6 +92,31 @@ class ValidationField(Base):
 
     regex = Column(Text)
     regex_prompt = Column(Text)
+    rule_source = Column(String, default="default")  # user | ai | default
+
+
+class ValidationRuleTemplate(Base):
+    """Curated SAP rule catalog. Embed name+aliases in memory; never sets flag_key."""
+    __tablename__ = "validation_rule_templates"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False, unique=True)
+    aliases = Column(Text, default="")
+
+    flag_mandatory = Column(Boolean, default=False)
+    flag_null = Column(Boolean, default=False)
+    flag_email = Column(Boolean, default=False)
+    flag_mobile = Column(Boolean, default=False)
+    flag_date = Column(Boolean, default=False)
+    flag_special_chars = Column(Boolean, default=False)
+
+    case_format = Column(String)
+    data_type = Column(String, default="string")
+    max_length = Column(Integer)
+    decimal_length = Column(Integer)
+    regex_prompt = Column(Text)
+
+    priority = Column(Integer, default=100)
+    active = Column(Boolean, default=True)
 
 
 class ValidationException(Base):

@@ -32,6 +32,14 @@ class FieldRuleIn(BaseModel):
     decimal_length: Optional[int] = None
     regex: Optional[str] = None
     regex_prompt: Optional[str] = None
+    rule_source: Optional[str] = "default"
+
+    @field_validator("rule_source")
+    @classmethod
+    def normalize_rule_source(cls, value: Optional[str]) -> str:
+        if value in ("user", "ai", "default"):
+            return value
+        return "default"
 
 
 class RegexGenerateRequest(BaseModel):
@@ -58,6 +66,28 @@ class RunFieldOut(BaseModel):
     decimal_length: Optional[int] = None
     regex: Optional[str] = None
     regex_prompt: Optional[str] = None
+    rule_source: str = "default"
+
+
+class SuggestFieldIn(BaseModel):
+    field_name: str
+    samples: list[str] = []
+
+
+class SuggestRulesRequest(BaseModel):
+    fields: list[SuggestFieldIn]
+    run_id: Optional[str] = None
+
+
+class SuggestedFieldOut(FieldRuleIn):
+    rule_source: str = "ai"
+    suggestion_source: str = "heuristic"
+    template_name: Optional[str] = None
+
+
+class SuggestRulesResponse(BaseModel):
+    suggestions: list[SuggestedFieldOut]
+    warning: Optional[str] = None
 
 
 class RunDetailOut(BaseModel):

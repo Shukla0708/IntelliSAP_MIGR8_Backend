@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import User, ValidationRun, ValidationField, ValidationException, ValidationProject
 from auth import get_current_user
-from services import s3_service, regex_generator, file_stream, job_queue
+from services import s3_service, regex_generator, file_stream, job_queue, rule_suggester, rule_templates
 from schemas import (
     CreateRunRequest,
     FieldRuleIn,
@@ -17,6 +17,8 @@ from schemas import (
     RegexGenerateResponse,
     RunDetailOut,
     RunFieldOut,
+    SuggestRulesRequest,
+    SuggestRulesResponse,
 )
 
 router = APIRouter(prefix="/api/runs", tags=["validation"])
@@ -153,6 +155,7 @@ def get_run(
                 decimal_length=f.decimal_length,
                 regex=f.regex,
                 regex_prompt=f.regex_prompt,
+                rule_source=f.rule_source or "default",
             )
             for f in field_rows
         ],
@@ -222,6 +225,7 @@ def save_rules(run_id: uuid.UUID, payload: list[FieldRuleIn], db: Session = Depe
         row.max_length = f.max_length
         row.decimal_length = f.decimal_length
         row.regex_prompt = f.regex_prompt
+        row.rule_source = f.rule_source or "default"
         # If the user wrote a plain-English rule, always ask Bedrock for the regex
         # so Rule 5 stays LLM-driven even if they didn't click Generate in the UI.
         if f.regex_prompt and f.regex_prompt.strip():
@@ -235,6 +239,29 @@ def save_rules(run_id: uuid.UUID, payload: list[FieldRuleIn], db: Session = Depe
     db.query(ValidationRun).filter_by(id=run_id).update({"status": "rules_configured"})
     db.commit()
     return {"ok": True}
+
+
+@router.post("/suggest-rules", response_model=SuggestRulesResponse)
+def suggest_rules_route(
+    payload: SuggestRulesRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return AI/heuristic rule suggestions. Does not write validation_fields."""
+    if not payload.fields:
+        raise HTTPException(400, "No fields provided")
+    if len(payload.fields) > 500:
+        raise HTTPException(400, "Too many fields (max 500)")
+
+    templates = rule_templates.load_templates(db)
+    result = rule_suggester.suggest_rules(
+        [{"field_name": f.field_name, "samples": f.samples} for f in payload.fields],
+        templates,
+    )
+    return SuggestRulesResponse(
+        suggestions=result["suggestions"],
+        warning=result.get("warning"),
+    )
 
 
 @router.post("/generate-regex", response_model=RegexGenerateResponse)

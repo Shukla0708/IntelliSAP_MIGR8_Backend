@@ -92,6 +92,8 @@ CREATE TABLE validation_fields (
 
     regex               TEXT,       -- final AI-generated pattern actually applied
     regex_prompt        TEXT,       -- the plain-English prompt the user typed (Groq input)
+    rule_source         TEXT NOT NULL DEFAULT 'default'
+                         CHECK (rule_source IN ('user','ai','default')),
 
     UNIQUE (run_id, field_name)
 );
@@ -233,3 +235,30 @@ CREATE TABLE comparison_discrepancies (
 );
 
 CREATE INDEX idx_comparison_discrepancies_run_id ON comparison_discrepancies(run_id);
+
+-- ------------------------------------------------------------
+-- Curated SAP rule catalog for "Apply rules with AI"
+-- Embeddings are computed in memory from name + aliases (no pgvector).
+-- Templates never set flag_key.
+-- ------------------------------------------------------------
+CREATE TABLE validation_rule_templates (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                    TEXT NOT NULL UNIQUE,
+    aliases                 TEXT NOT NULL DEFAULT '',
+    flag_mandatory          BOOLEAN NOT NULL DEFAULT false,
+    flag_null               BOOLEAN NOT NULL DEFAULT false,
+    flag_email              BOOLEAN NOT NULL DEFAULT false,
+    flag_mobile             BOOLEAN NOT NULL DEFAULT false,
+    flag_date               BOOLEAN NOT NULL DEFAULT false,
+    flag_special_chars      BOOLEAN NOT NULL DEFAULT false,
+    case_format             TEXT CHECK (case_format IN ('uppercase','lowercase','camelCase')),
+    data_type               TEXT NOT NULL DEFAULT 'string'
+                             CHECK (data_type IN ('char','int','decimal','string','boolean')),
+    max_length              INT,
+    decimal_length          INT,
+    regex_prompt            TEXT,
+    priority                INT NOT NULL DEFAULT 100,
+    active                  BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE INDEX idx_rule_templates_active ON validation_rule_templates(active);
