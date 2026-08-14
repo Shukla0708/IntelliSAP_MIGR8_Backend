@@ -60,6 +60,12 @@ def test_project_report_empty(client, auth_user):
     assert body["validation"]["completedRuns"] == 0
     assert body["readiness"]["validation"] == 0.0
     assert body["validation"]["recentRuns"] == []
+    assert body["comparison"]["totalRuns"] == 0
+    assert body["comparison"]["recentRuns"] == []
+    assert body["mapping"]["totalRuns"] == 0
+    assert body["mapping"]["recentRuns"] == []
+    assert body["readiness"]["comparison"] == 0.0
+    assert body["readiness"]["mapping"] == 0.0
 
 
 def test_project_report_not_found_for_other_user(client, auth_user):

@@ -19,10 +19,7 @@ router = APIRouter(prefix="/api/mappings", tags=["field-mapping"])
 
 
 def _get_owned_mapping(run_id: uuid.UUID, db: Session, current_user: User) -> Mapping:
-    id = run_id
-    print(run_id)
-    mapping = db.get(Mapping, id)
-    print(mapping)
+    mapping = db.get(Mapping, run_id)
     if not mapping:
         raise HTTPException(404, "Mapping run not found")
     project = db.get(ValidationProject, mapping.project_id)

@@ -3,18 +3,31 @@ from collections import defaultdict
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Float, cast, func
 from sqlalchemy.orm import Session
 
 from db.database import get_db
-from db.models import User, ValidationProject, ValidationRun
+from db.models import (
+    ComparisonRun,
+    Mapping,
+    MappingTemp,
+    User,
+    ValidationProject,
+    ValidationRun,
+)
 from auth import get_current_user
+from routers.mapping import _confirmed_counts_by_ids, _public_status
 from schemas import ProjectCreate, ProjectOut
 from schemas.reports import (
     ProjectReportOut,
+    ReportComparisonSection,
     ReportErrorByField,
     ReportErrorByType,
+    ReportMappingSection,
     ReportProject,
     ReportReadiness,
+    ReportRecentComparisonRun,
+    ReportRecentMappingRun,
     ReportRecentRun,
     ReportValidationSection,
 )
@@ -82,6 +95,7 @@ def get_project_report(
         db.query(ValidationRun)
         .filter(ValidationRun.project_id == project_id)
         .order_by(ValidationRun.created_at.desc())
+        .limit(100)
         .all()
     )
 
@@ -146,6 +160,14 @@ def get_project_report(
         recentRuns=recent_runs,
     )
 
+    comparison_section = _comparison_report(db, project_id)
+    mapping_section = _mapping_report(db, project_id)
+    readiness = _composite_readiness(
+        avg_health,
+        comparison_section.avgMatchRate,
+        mapping_section.approvalRate,
+    )
+
     return ProjectReportOut(
         project=ReportProject(
             id=str(project.id),
@@ -153,14 +175,115 @@ def get_project_report(
             created_at=project.created_at,
         ),
         generatedAt=datetime.utcnow(),
-        readiness=ReportReadiness(
-            score=avg_health,
-            validation=avg_health,
-            comparison=0.0,
-            mapping=0.0,
-        ),
+        readiness=readiness,
         validation=validation_section,
+        comparison=comparison_section,
+        mapping=mapping_section,
     )
+
+
+def _composite_readiness(
+    validation: float, comparison: float, mapping: float
+) -> ReportReadiness:
+    score = round(validation * 0.5 + comparison * 0.25 + mapping * 0.25)
+    return ReportReadiness(
+        score=score,
+        validation=validation,
+        comparison=comparison,
+        mapping=mapping,
+    )
+
+
+def _comparison_report(db: Session, project_id: uuid.UUID) -> ReportComparisonSection:
+    runs = (
+        db.query(ComparisonRun)
+        .filter(ComparisonRun.project_id == project_id)
+        .order_by(ComparisonRun.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    completed = [r for r in runs if r.status == "completed"]
+    total_mismatches = sum(
+        (r.different_count or 0) + (r.missing_count or 0) for r in runs
+    )
+    match_rates = [float(r.match_rate or 0) for r in completed]
+    avg_match = round(sum(match_rates) / len(match_rates)) if match_rates else 0
+
+    return ReportComparisonSection(
+        totalRuns=len(runs),
+        completedRuns=len(completed),
+        totalMismatches=total_mismatches,
+        avgMatchRate=avg_match,
+        matchedRecords=sum(r.matched_records or 0 for r in completed),
+        differentCount=sum(r.different_count or 0 for r in completed),
+        missingCount=sum(r.missing_count or 0 for r in completed),
+        recentRuns=[
+            ReportRecentComparisonRun(
+                id=str(r.id),
+                name=r.name,
+                status=r.status or "draft",
+                mismatches=(r.different_count or 0) + (r.missing_count or 0),
+                records=f"{r.total_preload_rows or 0} records",
+                ranAt=r.ran_at,
+            )
+            for r in runs[:8]
+        ],
+    )
+
+
+def _mapping_report(db: Session, project_id: uuid.UUID) -> ReportMappingSection:
+    runs = (
+        db.query(Mapping)
+        .filter(Mapping.project_id == project_id)
+        .order_by(Mapping.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    counts = _confirmed_counts_by_ids(db, [run.id for run in runs])
+    total_fields = sum(run.total_source_fields or 0 for run in runs)
+    confirmed_fields = sum(counts.get(run.id, (0, 0))[0] for run in runs)
+    unmapped = max(total_fields - confirmed_fields, 0)
+    approval_rate = round((confirmed_fields / total_fields) * 100) if total_fields else 0
+    completed_count = 0
+    recent = []
+    for run in runs:
+        confirmed, _ = counts.get(run.id, (0, 0))
+        public = _public_status(run.status or "processing", confirmed)
+        if public == "completed":
+            completed_count += 1
+        if len(recent) < 8:
+            recent.append(
+                ReportRecentMappingRun(
+                    id=str(run.id),
+                    name=run.mapping_name or "Field mapping run",
+                    status=public,
+                    unmapped=max((run.total_source_fields or 0) - confirmed, 0),
+                    fields=f"{run.total_source_fields or 0} fields",
+                    ranAt=run.created_at,
+                )
+            )
+
+    return ReportMappingSection(
+        totalRuns=len(runs),
+        completedRuns=completed_count,
+        totalFields=total_fields,
+        unmappedFields=unmapped,
+        approvalRate=approval_rate,
+        avgConfidence=_avg_mapping_confidence(db, [run.id for run in runs[:3]]),
+        recentRuns=recent,
+    )
+
+
+def _avg_mapping_confidence(db: Session, mapping_ids: list[uuid.UUID]) -> float:
+    if not mapping_ids:
+        return 0.0
+    score_expr = cast(MappingTemp.mapping[0]["confidence_score"].astext, Float)
+    avg = (
+        db.query(func.avg(score_expr))
+        .filter(MappingTemp.mapping_id.in_(mapping_ids))
+        .scalar()
+    )
+    return round(float(avg)) if avg is not None else 0.0
 
 
 @router.get("/{project_id}/runs")

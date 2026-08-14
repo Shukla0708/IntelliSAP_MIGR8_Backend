@@ -1,7 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from urllib.parse import unquote
+import logging
+import time
+
+from sqlalchemy import inspect
 
 from config import settings
 from db.database import engine
@@ -10,6 +14,7 @@ from routers import auth, projects, validation, mapping, comparison, chat
 from services import s3_service, job_queue
 
 app = FastAPI(title="MIGR8 AI — Validation API")
+logger = logging.getLogger("migr8.http")
 
 _CORS_ORIGINS = settings.cors_origin_list()
 
@@ -30,11 +35,23 @@ app.include_router(comparison.router)
 app.include_router(chat.router)
 
 
+@app.middleware("http")
+async def log_request_time(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Response-Time"] = f"{elapsed_ms:.0f}ms"
+    if elapsed_ms >= 250:
+        logger.warning("%s %s %.0fms", request.method, request.url.path, elapsed_ms)
+    return response
+
+
 @app.on_event("startup")
 def on_startup():
-    # For the hackathon: auto-create tables if they don't exist.
-    # In practice, run schema.sql directly against Postgres instead.
-    Base.metadata.create_all(bind=engine)
+    # Avoid inspecting/creating every table on each --reload against remote RDS.
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        Base.metadata.create_all(bind=engine)
     job_queue.start()
 
 

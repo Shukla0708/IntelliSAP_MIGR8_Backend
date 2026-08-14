@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +25,14 @@ from services.mapping_pipeline import run_mapping_job
 
 logger = logging.getLogger(__name__)
 
-_executor: ThreadPoolExecutor | None = None
+_executor = None
+
+
+def _build_executor():
+    """Heavy file jobs in a subprocess so they do not GIL-stall API requests."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="migr8-job")
+    return ProcessPoolExecutor(max_workers=1)
 
 
 def start(*, recover_stale: bool = True) -> None:
@@ -33,7 +41,7 @@ def start(*, recover_stale: bool = True) -> None:
     if recover_stale:
         _fail_stale_jobs()
     if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="migr8-job")
+        _executor = _build_executor()
 
 
 def stop() -> None:

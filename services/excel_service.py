@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable
+from datetime import date, datetime, time
 from pathlib import Path
 
 import xlsxwriter
@@ -14,7 +15,14 @@ from services.rules_engine import is_empty_raw, normalize_key, validate_cell
 
 MAX_STORED_EXCEPTIONS = 20
 MAX_EXCEPTIONS_PER_TYPE = 5
-PROGRESS_EVERY = 1_000
+PROGRESS_EVERY = 10_000
+
+_WORKBOOK_OPTIONS = {
+    "constant_memory": True,
+    "strings_to_urls": False,
+    "strings_to_numbers": False,
+    "strings_to_formulas": False,
+}
 
 ProgressCallback = Callable[[int, int | None], None]
 
@@ -72,7 +80,12 @@ def run_validation_from_path(
             item["_compiled_regex"] = None
         compiled_configs.append(item)
 
-    cfg_by_field = {c["field_name"]: c for c in compiled_configs}
+    ruled_columns: list[tuple[int, str, dict]] = []
+    for cfg in compiled_configs:
+        col_idx = _col_index(name_to_col, cfg["field_name"])
+        if col_idx is not None:
+            ruled_columns.append((col_idx, cfg["field_name"], cfg))
+
     key_field_names = [c["field_name"] for c in compiled_configs if c["flag_key"]]
     composite_keys = len(key_field_names) >= 2
     seen_keys_by_field = (
@@ -90,15 +103,15 @@ def run_validation_from_path(
     out_handle, out_name = tempfile.mkstemp(suffix=".xlsx")
     os.close(out_handle)
     out_path = Path(out_name)
-    workbook = xlsxwriter.Workbook(str(out_path), {"constant_memory": True})
+    workbook = xlsxwriter.Workbook(str(out_path), _WORKBOOK_OPTIONS)
     worksheet = workbook.add_worksheet("Validation")
     red = workbook.add_format({"bg_color": "FFC7CE"})
     header_fmt = workbook.add_format({"bold": True})
 
     for col, name in enumerate(header):
-        worksheet.write(0, col, name, header_fmt)
+        worksheet.write_string(0, col, str(name), header_fmt)
     reason_col_idx = len(header)
-    worksheet.write(0, reason_col_idx, "Validation_Failure_Reason", header_fmt)
+    worksheet.write_string(0, reason_col_idx, "Validation_Failure_Reason", header_fmt)
 
     write_row = 1
     for excel_row, values in file_stream.iter_data_rows(path, filename):
@@ -113,12 +126,11 @@ def run_validation_from_path(
         row_has_error = False
         failing_cols: set[int] = set()
 
-        for field_name, cfg in cfg_by_field.items():
-            col_idx = _col_index(name_to_col, field_name)
-            if col_idx is None or col_idx >= len(values):
+        for col_idx, field_name, cfg in ruled_columns:
+            if col_idx >= len(values):
                 continue
             cell_value = _empty_to_none(values[col_idx])
-            seen_keys = None if composite_keys else seen_keys_by_field.get(field_name, set())
+            seen_keys = None if composite_keys else seen_keys_by_field.get(field_name)
             reasons = validate_cell(cell_value, cfg, seen_keys)
             if reasons:
                 row_has_error = True
@@ -158,7 +170,7 @@ def run_validation_from_path(
             _write_cell(worksheet, write_row, col_idx, value, cell_format)
         if row_has_error:
             invalid_rows += 1
-            worksheet.write(write_row, reason_col_idx, "; ".join(row_reasons))
+            worksheet.write_string(write_row, reason_col_idx, "; ".join(row_reasons))
         else:
             valid_rows += 1
             worksheet.write_blank(write_row, reason_col_idx, None)
@@ -209,10 +221,23 @@ def _empty_to_none(value):
 
 
 def _write_cell(worksheet, row: int, col: int, value, cell_format=None) -> None:
+    """Typed writes skip xlsxwriter's per-cell token detection."""
     if value is None or value == "":
         worksheet.write_blank(row, col, None, cell_format)
         return
-    worksheet.write(row, col, value, cell_format)
+    if isinstance(value, str):
+        worksheet.write_string(row, col, value, cell_format)
+        return
+    if isinstance(value, bool):
+        worksheet.write_boolean(row, col, value, cell_format)
+        return
+    if isinstance(value, (int, float)):
+        worksheet.write_number(row, col, value, cell_format)
+        return
+    if isinstance(value, (datetime, date, time)):
+        worksheet.write_datetime(row, col, value, cell_format)
+        return
+    worksheet.write_string(row, col, str(value), cell_format)
 
 
 def _header_index(header: list) -> dict[str, int]:

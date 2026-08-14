@@ -47,6 +47,45 @@ class ReportReadiness(BaseModel):
     mapping: float
 
 
+class ReportRecentComparisonRun(BaseModel):
+    id: str
+    name: str
+    status: str
+    mismatches: int
+    records: str
+    ranAt: datetime | None
+
+
+class ReportComparisonSection(BaseModel):
+    totalRuns: int
+    completedRuns: int
+    totalMismatches: int
+    avgMatchRate: float
+    matchedRecords: int
+    differentCount: int
+    missingCount: int
+    recentRuns: list[ReportRecentComparisonRun]
+
+
+class ReportRecentMappingRun(BaseModel):
+    id: str
+    name: str
+    status: str
+    unmapped: int
+    fields: str
+    ranAt: datetime | None
+
+
+class ReportMappingSection(BaseModel):
+    totalRuns: int
+    completedRuns: int
+    totalFields: int
+    unmappedFields: int
+    approvalRate: float
+    avgConfidence: float
+    recentRuns: list[ReportRecentMappingRun]
+
+
 class ReportProject(BaseModel):
     id: str
     name: str
@@ -58,3 +97,5 @@ class ProjectReportOut(BaseModel):
     generatedAt: datetime
     readiness: ReportReadiness
     validation: ReportValidationSection
+    comparison: ReportComparisonSection
+    mapping: ReportMappingSection

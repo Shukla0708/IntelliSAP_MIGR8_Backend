@@ -32,7 +32,9 @@ def run_mapping_job(mapping_id: uuid.UUID) -> None:
             raise ValueError("Target SAP field list is empty")
 
         raw_matches = mapping_engine.top_candidates(source_fields, target_fields)
-        db.query(MappingTemp).filter_by(mapping_id=mapping.id).delete()
+        db.query(MappingTemp).filter_by(mapping_id=mapping.id).delete(
+            synchronize_session=False
+        )
         mapped_fields = 0
         number_range_type = mapping.number_range_type
 
@@ -74,9 +76,6 @@ def run_mapping_job(mapping_id: uuid.UUID) -> None:
                 key_field=match["key_field"],
                 mapping=final_candidates,
             ))
-            mapping.mapped_fields = mapped_fields
-            mapping.total_source_fields = len(source_fields)
-            db.commit()
 
         mapping.total_source_fields = len(source_fields)
         mapping.mapped_fields = mapped_fields
