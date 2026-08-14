@@ -10,7 +10,7 @@
 | --- | --- |
 | Project name | MIGR8 AI — Validation API |
 | Path | `IntelliSAP_MIGR8_Backend/` |
-| Purpose | Auth, validation runs, field mapping, and project reports for the MIGR8 AI frontend |
+| Purpose | Auth, validation, field mapping, comparison, project reports, and grounded chat for the MIGR8 AI frontend |
 | Status | Hackathon demo-ready |
 | Default port | `8000` |
 | OpenAPI | `http://localhost:8000/docs` |
@@ -23,16 +23,18 @@
 | --- | --- | --- |
 | Framework | **FastAPI** `0.115` | Uvicorn with `--reload` for local dev |
 | ORM | **SQLAlchemy** `2.0` | Declarative models in `db/models.py` |
-| DB | **PostgreSQL** | Via `psycopg2-binary`; URL from `.env` (RDS in deploy) |
-| Auth | **JWT** (`python-jose`) + **bcrypt** (direct; not passlib) | Bearer token |
+| DB | **PostgreSQL** | Via `psycopg2-binary`; URL from `.env` |
+| Auth | **JWT** (`python-jose`) + **bcrypt** | Bearer token; no server-side session store |
 | Files | **boto3** → S3, or **local disk** | `STORAGE_BACKEND=auto\|local\|s3` |
-| Excel | **openpyxl** | Headers, red-fill failures, reason column |
-| AI rules / mapping | **AWS Bedrock** Claude Sonnet 5 | Plain English → regex; field-mapping re-rank |
-| Bedrock HTTP | **httpx** | Used when `BEDROCK_ACCESS_KEY` is set (bearer REST) |
-| Embeddings (mapping) | **numpy** + local TF-IDF | No model download; swappable later |
-| Config | **pydantic-settings** | Loads `.env`; `extra="ignore"` for legacy vars |
+| Excel read | **openpyxl** (read-only), **polars** + **fastexcel** (calamine) | Via `services/file_stream.py` |
+| Excel write | **XlsxWriter** `constant_memory` | Streaming annotated reports (validation + comparison) |
+| AI / rules | **AWS Bedrock** Claude Sonnet 5 | Regex, mapping rank, rule suggester, chat |
+| Embeddings | **Cohere Embed v4** on Bedrock | TF-IDF fallback when Bedrock unavailable |
+| Bedrock HTTP | **httpx** | When `BEDROCK_ACCESS_KEY` is set (bearer REST) |
+| Config | **pydantic-settings** | Loads `.env`; `extra="ignore"` |
 | Schemas | **Pydantic v2** | Package under `schemas/` |
-| Python | **3.12+ / 3.13** | Needs `psycopg2-binary>=2.9.11` on Windows |
+| Tests | **pytest** `8.3` | Needs live Postgres + `.env` |
+| Python | **3.12+** | `psycopg2-binary>=2.9.11` on Windows |
 
 ---
 
@@ -40,61 +42,58 @@
 
 ```
 IntelliSAP_MIGR8_Backend/
-├── main.py                 # FastAPI app, CORS, startup create_all, /health, local file serve
-├── config.py               # Settings from .env (incl. bedrock_region, cors_origins)
-├── auth.py                 # hash/verify password, JWT, get_current_user
-├── schema.sql              # Canonical Postgres DDL (preferred over auto-create)
-├── migrations/             # Incremental SQL (apply after schema exists)
-│   ├── 001_validation_run_names.sql
-│   ├── 002_field_mapping_key_and_number_range.sql  # number range + key flags
-│   └── 003_comparison_runs.sql  # comparison tables + key index
+├── main.py                     # FastAPI app, CORS, startup/shutdown, /health, local file serve
+├── config.py                   # Settings from .env (bedrock_region, cors_origins, etc.)
+├── auth.py                     # bcrypt hash/verify, JWT, get_current_user
+├── schema.sql                  # Canonical Postgres DDL (preferred over auto-create)
 ├── requirements.txt
 ├── .env.example
-├── Project.md              # This file
-├── scripts/
-│   ├── check_aws_access.py      # S3 + Bedrock smoke checks
-│   ├── probe_bedrock_profiles.py  # Try inference profile IDs
-│   ├── test_invoke_model.py       # Minimal Bedrock converse call
-│   ├── test_regex_bedrock.py      # End-to-end regex_generator test
-│   └── apply_run_name_migration.py
-├── tests/
-│   ├── test_bedrock_llm.py        # Mocked Bedrock regex + mapping tests
-│   ├── test_composite_keys.py     # Composite / single-key uniqueness
-│   ├── test_run_names.py          # Run name uniqueness + list/detail
-│   └── test_project_report.py     # GET /api/projects/{id}/report
+├── Project.md
+├── data/
+│   └── sap_ddic_catalog.json   # SAP DDIC metadata for rule suggestions (~34k lines)
+├── migrations/
+│   ├── 001_validation_run_names.sql
+│   ├── 002_field_mapping_key_and_number_range.sql
+│   ├── 003_comparison_runs.sql
+│   ├── 003_run_progress.sql
+│   └── 004_validation_rule_templates.sql
+├── scripts/                    # apply_* migrations, AWS/Bedrock smoke tests, DDIC tooling
+├── tests/                      # 11 pytest modules (see Tests section)
 ├── db/
-│   ├── database.py         # engine, SessionLocal, get_db
-│   └── models.py           # User, ValidationProject, ValidationRun, Field, Exception, Mapping, MappingTemp, FinalMapping, ComparisonRun, ComparisonDiscrepancy
+│   ├── database.py             # engine, SessionLocal, get_db
+│   └── models.py               # SQLAlchemy models
 ├── schemas/
-│   ├── __init__.py         # Re-exports for `from schemas import ...`
-│   ├── auth.py
-│   ├── projects.py
-│   ├── validation.py
-│   ├── comparison.py       # Create/Execute requests + review response (comparison)
-│   ├── reports.py
-│   └── mapping.py          # ConfirmMappingRequest / ConfirmedFieldIn (mapping)
+│   ├── auth.py, projects.py, validation.py, mapping.py
+│   ├── comparison.py, reports.py, chat.py
+│   └── __init__.py
 ├── routers/
-│   ├── auth.py             # /api/auth/*
-│   ├── projects.py         # /api/projects/*
-│   ├── validation.py       # /api/runs/*
-│   ├── mapping.py          # /api/mappings/*
-│   ├── comparison.py       # /api/comparisons/*
-│   └── chat.py             # /api/chat — grounded results assistant
+│   ├── auth.py                 # /api/auth/*
+│   ├── projects.py             # /api/projects/*
+│   ├── validation.py           # /api/runs/*
+│   ├── mapping.py              # /api/mappings/*
+│   ├── comparison.py           # /api/comparisons/*
+│   └── chat.py                 # /api/chat
 └── services/
-    ├── aws_client.py        # boto3 clients (S3 uses AWS_REGION; Bedrock uses BEDROCK_REGION)
-    ├── bedrock_llm.py       # Bedrock Converse wrapper (boto3 or REST bearer)
-    ├── s3_service.py
-    ├── excel_service.py
-    ├── rules_engine.py
-    ├── regex_generator.py
-    ├── file_parser.py       # source/target field-list CSV+XLSX parsing (mapping)
-    ├── embedding_service.py # Cohere Embed v4 on Bedrock (TF-IDF fallback)
-    ├── mapping_engine.py    # cosine top-3 candidates + datatype match score (mapping)
-    ├── llm_mapping.py       # Bedrock re-rank + reasoning (mapping)
-    ├── datatype_matcher.py  # SAP-type compatibility matrix (mapping)
-    ├── comparison_file_service.py  # streaming xlsx read/write for comparison
-    ├── comparison_engine.py        # composite-key join, compare, top-50 (comparison)
-    └── chat_service.py      # Context packer + Claude Q&A (no SQL from the model)
+    ├── aws_client.py           # boto3 S3 (AWS_REGION) + Bedrock (BEDROCK_REGION)
+    ├── bedrock_llm.py          # Converse wrapper (boto3 or REST bearer)
+    ├── s3_service.py           # upload/download/presigned URLs; local fallback
+    ├── file_stream.py          # Stream CSV/XLSX headers and rows
+    ├── excel_service.py        # Streaming validation → annotated XLSX + stats
+    ├── rules_engine.py         # Per-cell validation rules
+    ├── regex_generator.py      # Bedrock plain-English → regex
+    ├── rule_templates.py       # Curated SAP rule catalog loader/seeder
+    ├── rule_suggester.py       # Heuristics + embedding + LLM rule suggestions
+    ├── sap_ddic.py             # DDIC catalog helpers for rule suggestions
+    ├── job_queue.py            # In-process ProcessPoolExecutor for long jobs
+    ├── mapping_pipeline.py     # Background mapping: embed → top-3 → LLM rank
+    ├── file_parser.py          # Source/target field-list parsing (mapping)
+    ├── embedding_service.py    # Cohere Embed v4 or local TF-IDF
+    ├── mapping_engine.py       # Cosine top-3 + datatype scores
+    ├── llm_mapping.py          # Bedrock re-rank with confidence + reasoning
+    ├── datatype_matcher.py     # SAP datatype compatibility matrix
+    ├── comparison_file_service.py  # Streaming xlsx read/write for comparison
+    ├── comparison_engine.py    # Composite-key join, equivalence, top-50 discrepancies
+    └── chat_service.py         # Grounded Q&A from packed JSON context
 ```
 
 ---
@@ -105,30 +104,27 @@ Copy `.env.example` → `.env`:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | e.g. `postgresql://user:pass@host:5432/migr8` |
-| `JWT_SECRET` | yes | Signing key for access tokens |
+| `DATABASE_URL` | yes | PostgreSQL connection string |
+| `JWT_SECRET` | yes | JWT signing key |
 | `JWT_ALGORITHM` | no | Default `HS256` |
 | `JWT_EXPIRE_MINUTES` | no | Default `1440` (24h) |
-| `AWS_ACCESS_KEY_ID` | optional | IAM keys for S3; omit on EC2 to use instance role |
-| `AWS_SECRET_ACCESS_KEY` | optional | Same |
-| `AWS_REGION` | no | Default `ap-south-1` in code — **S3 / RDS region** (e.g. `ap-southeast-2`) |
+| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` |
+| `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — local download URLs |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | optional | S3; omit on EC2 for instance role |
+| `AWS_REGION` | no | **S3 / RDS region** (e.g. `ap-southeast-2`) |
 | `S3_BUCKET` | no | Default `migr8-ai-validation` |
-| `STORAGE_BACKEND` | no | `auto` (default) \| `local` \| `s3` — use `s3` on EC2 |
-| `PUBLIC_API_BASE_URL` | no | Default `http://localhost:8000` — used for local download URLs |
-| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` — regex + mapping LLM |
-| `BEDROCK_EMBED_MODEL_ID` | no | Default `cohere.embed-v4:0` — field-mapping embeddings |
-| `EMBEDDING_BACKEND` | no | `auto` (Cohere if Bedrock creds) \| `bedrock` \| `local` |
-| `CORS_ORIGINS` | no | Comma-separated frontend origins (add EC2 URL on deploy) |
+| `BEDROCK_MODEL_ID` | no | Default `us.anthropic.claude-sonnet-5` |
+| `BEDROCK_EMBED_MODEL_ID` | no | Default `cohere.embed-v4:0` |
+| `EMBEDDING_BACKEND` | no | `auto` \| `bedrock` \| `local` |
+| `BEDROCK_REGION` | no | Default `us-east-1` — **Bedrock endpoint** (separate from `AWS_REGION`) |
+| `BEDROCK_ACCESS_KEY` | optional | `ABSK…` bearer key for Bedrock REST |
+| `CORS_ORIGINS` | no | Comma-separated frontend origins |
 
-**Important:** `AWS_REGION` and `BEDROCK_REGION` are intentionally separate. S3/RDS can live in `ap-southeast-2` while Bedrock inference profiles like `us.anthropic.claude-sonnet-5` must be called via `us-east-1`.
-
-`config.py` uses `extra="ignore"` so legacy keys (e.g. `GROQ_API_KEY`) in `.env` do not crash startup.
-
-CORS origins are read from `CORS_ORIGINS`. Default includes common localhost ports. On EC2, add your frontend URL.
+**Important:** `AWS_REGION` and `BEDROCK_REGION` are intentionally separate. S3/RDS can live in `ap-southeast-2` while US inference profiles must be called via `us-east-1`.
 
 ---
 
-## Data model
+## Data Model
 
 ```
 users 1──* validation_projects 1──* validation_runs
@@ -145,457 +141,272 @@ users 1──* validation_projects 1──* validation_runs
 | --- | --- |
 | `users` | Register / login; JWT `sub` = user id |
 | `validation_projects` | Scopes runs per user |
-| `validation_runs` | One upload → configure → execute cycle + aggregate stats; **`name` VARCHAR(120) NOT NULL**, unique per `(project_id, name)` |
-| `validation_fields` | Per-column rule flags/config for a run |
-| `validation_exceptions` | Capped failure samples (~60) for results UI |
-| `mappings` | One source+target upload → embed → LLM-rank cycle; created immediately on "Start Mapping"; `number_range_type` is `internal` \| `external`, chosen at that point |
-| `mapping_temp` | One row per source field; `key_field` mirrors the key flag in the uploaded source file; `mapping` JSONB holds its top-3 SAP candidates (embedding score, datatype match score, LLM confidence/reasoning) |
-| `final_mapping` | One row per source field the user has confirmed on the frontend; `(mapping_id, source_field)` unique — re-confirming a field updates its row. `key` is copied from `mapping_temp.key_field` and marks a field as part of the comparison business key; several rows may set it |
-| `comparison_runs` | One preload+postload upload → execute cycle plus the stats the review page shows; `name` unique per `(project_id, name)`; `mapping_id` NULL means same-name column matching |
-| `comparison_discrepancies` | Up to 50 rows per comparison run, the worst ones by severity then row number |
+| `validation_runs` | Upload → rules → execute; stats, S3 keys, progress columns |
+| `validation_fields` | Per-column rule config; `rule_source` (`user` \| `ai` \| `default`) |
+| `validation_rule_templates` | Curated SAP rule catalog for AI suggestions |
+| `validation_exceptions` | **Capped** failure samples for results UI (~20 total) |
+| `mappings` | Field-mapping run; `number_range_type`, status lifecycle |
+| `mapping_temp` | Top-3 candidates JSONB per source field; `key_field` |
+| `final_mapping` | User-confirmed mappings; `key` = comparison business key part |
+| `comparison_runs` | Preload/postload comparison run |
+| `comparison_discrepancies` | Up to 50 worst discrepancies per run |
 
-**Run status:** `draft` → `rules_configured` → `running` → `completed` \| `failed`
-**Comparison status:** `draft` → `running` → `completed` \| `failed`
-**Mapping status:** `processing` → `completed` \| `failed` (pipeline-only; confirmation is tracked separately by the presence of `final_mapping` rows, not a status value)
+**Status values:**
 
-**Run names:** User-provided at create (trimmed, non-empty, ≤120 chars). Duplicate within project → HTTP 409.
+- Validation: `draft` → `rules_configured` → `running` → `completed` \| `failed`
+- Mapping: `processing` → `awaiting_approval` → `completed` \| `failed`
+- Comparison: `draft` → `running` → `completed` \| `failed`
+
+**Full per-row validation detail** is in the annotated Excel on S3 (`result_s3_key`), not in a separate row-results table. The UI downloads that workbook for all rows + `Validation_Failure_Reason`.
 
 **S3 keys:**
 
-- Source: `validations/{run_id}/source/{filename}`
-- Result: `validations/{run_id}/result/{filename}`
-- Comparison: `comparisons/{run_id}/preload/{filename}`, `.../postload/{filename}`, `.../result/comparison_{filename}`
+- Validation: `validations/{run_id}/source/{filename}`, `validations/{run_id}/result/{stem}.xlsx`
+- Mapping: `mappings/{id}/source/…`, `mappings/{id}/target/…`
+- Comparison: `comparisons/{run_id}/preload/…`, `postload/…`, `result/comparison_{filename}`
 
-Prefer applying `schema.sql` in pgAdmin/`psql`. On startup, `Base.metadata.create_all` also creates missing tables (hackathon shortcut).
-
-```bash
-psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql   # existing DBs with run_name
-```
-
-That migration renames `run_name` → `name`, backfills duplicate `"New validation run"` rows to unique names, drops the default, and adds `UNIQUE (project_id, name)`.
-
-The field-mapping key flags and number range come next (or run `python scripts/apply_002_field_mapping_migration.py`):
-
-```bash
-psql "$DATABASE_URL" -f migrations/002_field_mapping_key_and_number_range.sql
-```
-
-Then the comparison module (or run `python scripts/apply_comparison_migration.py`):
-
-```bash
-psql "$DATABASE_URL" -f migrations/003_comparison_runs.sql
-```
-
-003 creates `comparison_runs` + `comparison_discrepancies` and indexes `final_mapping.key`. Startup auto-create makes the two new tables but cannot add columns to an existing `final_mapping`/`mapping_temp`, so 002 is required on any database that already had mappings — run it before 003.
+**Migrations (existing DBs):** apply in order `001` → `002` → `003_comparison_runs` → `003_run_progress` → `004_validation_rule_templates`, or use matching `scripts/apply_*` helpers. Fresh installs: `psql "$DATABASE_URL" -f schema.sql`.
 
 ---
 
-## API map
+## API Map
 
-### Health & local files
+All protected routes use Bearer JWT via `get_current_user`.
+
+### Root (`main.py`)
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| GET | `/health` | no | `{ status, storage, llm, model, bedrock_region }` |
-| GET | `/api/local-files/{key:path}` | no | Serves files from `local_storage/` when `storage=local` |
+| GET | `/health` | no | `status`, `storage`, `llm`, `model`, `embed_model`, `embedding_backend`, `bedrock_region` |
+| GET | `/api/local-files/{key:path}` | no | Serves `local_storage/` when `storage=local` |
 
 ### Auth — `/api/auth`
 
-| Method | Path | Auth | Body / notes | Response |
-| --- | --- | --- | --- | --- |
-| POST | `/register` | no | `fullName`, `email`, `password` | `{ token, user }` |
-| POST | `/login` | no | `email`, `password` | `{ token, user }` |
-| GET | `/me` | Bearer | — | `UserOut` |
-| POST | `/logout` | Bearer | Stateless JWT ack | `{ message, userId }` |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/register` | `{ fullName, email, password }` → `{ token, user }` |
+| POST | `/login` | `{ email, password }` → `{ token, user }` |
+| GET | `/me` | Current user |
+| POST | `/logout` | Stateless ack |
 
 ### Projects — `/api/projects`
 
-| Method | Path | Auth | Notes |
-| --- | --- | --- | --- |
-| POST | `/` | Bearer | `{ name }` → `ProjectOut` |
-| GET | `/` | Bearer | List current user's projects |
-| GET | `/{project_id}/runs` | Bearer | Runs list for project cards |
-| GET | `/{project_id}/report` | Bearer | Aggregated validation KPIs (`ProjectReportOut`) |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/` | Create project `{ name }` |
+| GET | `/` | List current user's projects |
+| GET | `/{project_id}/report` | Aggregated KPIs (`ProjectReportOut`) |
+| GET | `/{project_id}/runs` | Validation runs for project cards |
+
+### Validation — `/api/runs`
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/` | Cross-project list; optional `project_id`, `limit`, `offset` |
+| POST | `/?project_id=` | Body `{ name }` → `{ run_id }`; duplicate → **409** |
+| GET | `/{run_id}` | Draft UI: name, status, fields, progress, file flags |
+| POST | `/{run_id}/upload` | Multipart `file` (.csv or .xlsx); returns `{ fields }` |
+| PUT | `/{run_id}/rules` | `FieldRuleIn[]`; Bedrock regex when `regex_prompt` set |
+| POST | `/suggest-rules` | AI/heuristic rule suggestions (read-only) |
+| POST | `/generate-regex` | `{ field_name, prompt }` → `{ regex }`; failure → **422** |
+| POST | `/{run_id}/execute` | **202** — queues background validation job |
+| GET | `/{run_id}/result` | Results payload + capped `exceptions` + progress fields |
+| GET | `/{run_id}/download-url` | Presigned/local URL for full annotated XLSX |
 
 ### Field mapping — `/api/mappings`
 
-| Method | Path | Auth | Notes |
-| --- | --- | --- | --- |
-| GET | `/` | Bearer | Mapping runs owned by the caller, newest first; optional `project_id`, `limit`, `offset`. Returns `[{ mappingRunId, mappingName, status, sourceFilename, targetFilename, totalSourceFields, mappedFields, confirmedFieldCount, keyFieldCount, createdAt, projectId, projectName }]` — the comparison setup screen filters on the two counts |
-| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` (xlsx/csv) + Form field **`number_range_type`** (`"internal"` \| `"external"`, required — 422 if missing/invalid). Creates the `mappings` row immediately ("Start Mapping"), then runs the pipeline synchronously (upload → parse → embed → top-3 → LLM re-rank → persist to `mapping_temp`) → mapping result JSON |
-| GET | `/{run_id}/result` | Bearer | Re-fetch the same result JSON from `mapping_temp`; each row also carries `confirmedTargetField` (looked up from `final_mapping`, `null` if not yet confirmed) |
-| GET | `/{run_id}/confirmed` | Bearer | Confirmed `final_mapping` rows: `{ sourceField, targetField, isKey }` ordered by source field |
-| POST | `/{run_id}/confirm` | Bearer | Body `{"fields": [{"source_field", "target_field"}]}` (snake_case on the wire — see schemas below); validates each `target_field` is one of that source field's persisted candidates, then upserts into `final_mapping` (per-field, keyed on `(mapping_id, source_field)`), carrying over `mapping_temp.key_field` into `final_mapping.key`. Several rows may carry `key` — together they form the composite comparison key |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/` | List runs; optional `project_id`, `limit`, `offset` |
+| GET | `/stats` | Dashboard counts: `approved`, `awaitingApproval`, `processing`, `failed`, `total` |
+| POST | `/?project_id=` | Multipart source + target + Form `number_range_type`; **202** async pipeline |
+| GET | `/{run_id}/result` | Full mapping JSON with prospects + `confirmedTargetField` |
+| PATCH | `/{run_id}` | Rename run |
+| GET | `/{run_id}/target-fields` | Full SAP target catalog for manual picks |
+| GET | `/{run_id}/confirmed` | Confirmed `final_mapping` rows |
+| POST | `/{run_id}/confirm` | Upsert confirmations; target must be in catalog or candidates |
 
-**Source file** must have a Field Name column, a Description column, a **Key Field flag** column, and a **Datatype** column. **Target file** must have SAP Table, SAP Field, Description, **Table Description**, and **Datatype** columns (case-insensitive, some header aliases accepted — see `file_parser.py`). Key Field flag accepts `Y/N`, `X`, `TRUE/FALSE`, `1/0`, `yes/no` (case-insensitive), normalized to boolean.
+### Comparison — `/api/comparisons`
 
-**Internal vs. external number range** (chosen once per run via `number_range_type`): for a source field flagged as a Key Field, `"internal"` means SAP will assign the key itself, so the AI must **not** pre-map it — that row's `prospects` is the **entire target catalog** (every uploaded target field, not just top-3), with `semanticSimilarity`/`confidence` both `null` (only `datatypeMatchScore` is real) and a fixed `reasoning` string telling the user to map it manually. `"external"` (or any non-key field) goes through the normal embed → top-3 → LLM re-rank path regardless of `key_field`.
-
-**Response shape** (camelCase). Note `sourceDescription` is not persisted (dropped from `mapping_temp`'s columns) and is omitted from the response:
-
-```json
-{
-  "mappingRunId": "...", "status": "completed", "numberRangeType": "external",
-  "sourceFilename": "...", "targetFilename": "...", "totalSourceFields": 42, "mappedFields": 40,
-  "rows": [
-    {
-      "sourceField": "Customer Name",
-      "keyField": false,
-      "confirmedTargetField": null,
-      "prospects": [
-        {
-          "targetField": "KNA1.NAME1", "sapTable": "KNA1", "sapField": "NAME1",
-          "targetDescription": "...", "semanticSimilarity": 0.83,
-          "datatypeMatchScore": 100, "confidence": 91.5,
-          "reasoning": "Direct semantic match ... (20-30 words)"
-        }
-      ]
-    }
-  ]
-}
-```
-| POST | `/?project_id=` | Bearer | Multipart `source_file` + `target_file` → pipeline → `mapping_temp` |
-| GET | `/` | Bearer | Optional `project_id`; list mapping runs for the current user |
-| GET | `/{run_id}/result` | Bearer | Re-fetch mapping result JSON (includes `confirmedTargetField`) |
-| POST | `/{run_id}/confirm` | Bearer | Body `{ fields: [{ sourceField, targetField }] }` → upsert `final_mapping` |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/` | Cross-project list; optional `project_id`, `limit`, `offset` |
+| POST | `/?project_id=` | Body `{ name }` → `{ run_id }`; duplicate → **409** |
+| POST | `/{run_id}/upload` | Multipart `preload_file` + `postload_file` (.xlsx only) |
+| GET | `/{run_id}/available-mappings` | Completed mappings with confirmed fields |
+| POST | `/{run_id}/execute` | Body `ExecuteComparisonRequest`; **202** async job |
+| GET | `/{run_id}/result` | Review payload (camelCase) |
+| GET | `/{run_id}/download-url` | Annotated preload report URL |
 
 ### Chat — `/api/chat`
 
-| Method | Path | Auth | Notes |
-| --- | --- | --- | --- |
-| POST | `/` | Bearer | Body `{ message, history?, context: { page, project_id?, run_id?, mapping_id? } }` → `{ reply, refused, page }`. Backend packs owned results; Claude answers from that JSON only. Off-topic questions are refused without a model call. |
-
-**Source file** columns: Field Name, Description, Key Field flag, Datatype. **Target file**: SAP Table, SAP Field, Description, Table Description, Datatype (aliases in `file_parser.py`).
-
-Ownership: every run/project access checks the JWT user owns the project.
-
-### Validation runs — `/api/runs`
-
-| Method | Path | Auth | Notes |
-| --- | --- | --- | --- |
-| GET | `/` | Bearer | Cross-project list; optional `project_id`, `limit`, `offset` |
-| POST | `/?project_id=` | Bearer | Body `{ name }` → `{ run_id }`; duplicate → **409** |
-| GET | `/{run_id}` | Bearer | Draft edit UI: `name`, `status`, `fields[]`, `has_source_file` |
-| POST | `/{run_id}/upload` | Bearer | Multipart `file`; stores S3/local; returns `{ fields }` |
-| PUT | `/{run_id}/rules` | Bearer | `FieldRuleIn[]` → persists flags/config; re-generates regex from `regex_prompt` when set |
-| POST | `/generate-regex` | Bearer | `{ field_name, prompt }` → `{ regex }`; failure → **422** `{ message, reason }` |
-| POST | `/{run_id}/execute` | Bearer | Sync validation; updates stats + exceptions |
-| GET | `/{run_id}/result` | Bearer | Payload for results page |
-| GET | `/{run_id}/download-url` | Bearer | `{ url }` presigned GET (or local URL) |
-
-### Comparison runs — `/api/comparisons`
-
-| Method | Path | Auth | Notes |
-| --- | --- | --- | --- |
-| GET | `/` | Bearer | Cross-project list; optional `project_id`, `limit`, `offset`; items carry `records`, `mismatches`, `projectId`, `projectName` |
-| POST | `/?project_id=` | Bearer | Body `{ name }` → `{ run_id }`; duplicate name in project → **409** |
-| POST | `/{run_id}/upload` | Bearer | Multipart `preload_file` + `postload_file`, **.xlsx only** (anything else → 400). Returns both header rows. Files over 200,000 rows → 400 |
-| GET | `/{run_id}/available-mappings` | Bearer | Completed mappings in the same project that have confirmed fields, with `confirmedFieldCount` + `keyFieldCount` |
-| POST | `/{run_id}/execute` | Bearer | Body `{ mapping_id?, business_key_columns_preload?, business_key_columns_postload? }`; runs the comparison synchronously and stores stats, up to 50 discrepancies, and the annotated report |
-| GET | `/{run_id}/result` | Bearer | Review payload (camelCase) for the reconciliation page |
-| GET | `/{run_id}/download-url` | Bearer | `{ url }` for the annotated preload report |
-
-**Column matching.** With a `mapping_id`, `final_mapping` decides everything: each row's `source_field` is a preload column and its `target_field` (`"{sap_table}.{sap_field}"`) resolves to a postload column by full dotted name or by the SAP field suffix. Without one, every column whose name appears in both files is compared.
-
-**Row matching.** With a mapping, all `final_mapping.key` rows form the composite business key (at least one is required, otherwise 422). Without one, `business_key_columns_preload`/`_postload` give an explicit composite key; if omitted, the first shared column is used. Key columns are excluded from value comparison. A preload row with no postload match is a `DROPPED_RECORD`; a postload-only row is an `EXTRA_RECORD`; both count toward `missingCount`.
-
-**Value equivalence** (`values_equivalent` in `comparison_engine`). A load rewrites how values are spelled, so these are treated as equal and never reported:
-
-| Preload | Postload | Rule |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| `100045` | `0000100045` / `'0000100045` | Leading zeros on numbers (SAP ALPHA conversion); an Excel apostrophe that forces the cell to stay text |
-| `1000` | `1,000.00` / `1 000` / `1.000,00` / `$1,000.00` | Decimal noise, grouping separators, and a currency symbol; with both `,` and `.` the rightmost is the decimal point |
-| `-100` | `100-` / `(100)` / `−100` | Sign written in front, trailing (SAP), as accounting parentheses, or as a unicode minus |
-| `2024-01-05` | `05.01.2024` / `2024-01-05 00:00:00` | Date/datetime format, and a midnight time component |
-
-Everything else still surfaces: `1000` vs `1000.01`, a value against a blank (blank is not zero), and `1E5` vs `100000` (exponent notation stays text) are `VALUE_MISMATCH`; case/punctuation-only text differences remain `FORMAT_CHANGE` at `info`. Zero padding is ignored on the **business key** too (`canonical_key_part`) — otherwise a preload `100045` never meets a postload `0000100045` and both rows report as missing. Keys use the numeric rule only, so an ambiguous date can't silently join two rows.
-
-Two consequences worth knowing: a genuinely zero-significant text code (postal code `01234` vs `1234`) counts as equal because the column is numeric, and slash dates are matched under any reading that parses (`05/01/2024` matches both January 5 and May 1).
-
-Ownership: every comparison access checks the JWT user owns the project.
+| POST | `/` | Grounded Q&A from packed owned-project JSON; off-topic refused |
 
 ---
 
-## Services (behavior)
+## Background Jobs (`services/job_queue.py`)
 
-### `rules_engine.validate_cell`
+Started on app startup; stopped on shutdown. Uses `ProcessPoolExecutor(max_workers=1)` in production (`ThreadPoolExecutor` under pytest).
 
-Per-cell checks driven by field config:
+| Submit | Job | Trigger |
+| --- | --- | --- |
+| `submit_validation(run_id)` | Stream-validate source → upload annotated XLSX → persist stats + exceptions | `POST /api/runs/{id}/execute` |
+| `submit_mapping(run_id)` | `mapping_pipeline.run_mapping_job` | `POST /api/mappings/` |
+| `submit_comparison(run_id)` | `comparison_engine.run_comparison` | `POST /api/comparisons/{id}/execute` |
 
-- Mandatory / literal null-N/A
-- Data types: int, decimal, boolean, string/char
-- Max length, decimal precision
-- Case: uppercase / lowercase / camelCase
-- Email, mobile, date formats, special chars
-- Custom regex via **`re.fullmatch`**
-- Single-column key uniqueness (`seen_keys` set per field)
-
-**Key normalization:** `normalize_key()` treats Excel `1` and `1.0` as the same key.
-
-**Dates (Excel-aware):** Accepts `datetime`/`date` objects from openpyxl plus string formats (`%Y-%m-%d`, `%d-%m-%Y`, `%m/%d/%Y`, `%d/%m/%Y`, `%Y%m%d`, `%d%m%y`, etc.). Date separators are not flagged as special chars when the value is a valid date.
-
-### `excel_service.run_validation`
-
-- **`extract_headers`** — row 1 → column names for the rules UI
-- **`run_validation`** — annotate workbook (red fill, `Validation_Failure_Reason` column), return stats + exceptions
-
-**Composite keys:** When **two or more** fields have `flag_key`, uniqueness is enforced on the **combined** tuple (e.g. `CustomerID + OrderID`), not per column. Duplicate pairs flag all key columns with `Duplicate composite key value (same as row N)`.
-
-**Exception sampling:** At most **5 rows per error type** and **20 total** stored (`MAX_EXCEPTIONS_PER_TYPE`, `MAX_STORED_EXCEPTIONS`) so one noisy error does not hide others.
-
-### `regex_generator`
-
-Bedrock Claude Sonnet 5 via `bedrock_llm.chat()` → JSON `{"regex":"..."}`. Strips `^`/`$` (engine uses `fullmatch`). On **`PUT /{run_id}/rules`**, if `regex_prompt` is set, Bedrock regenerates `regex` (Rule 5 stays LLM-driven even if UI Generate was skipped). Falls back to client-supplied `regex` on failure.
-
-### `bedrock_llm`
-
-- **Auth path A:** `BEDROCK_ACCESS_KEY` set → REST `POST …/converse` with `Authorization: Bearer …` (httpx)
-- **Auth path B:** No API key → boto3 `bedrock-runtime` client (IAM keys or instance role)
-- Uses **`BEDROCK_REGION`** for the endpoint (not `AWS_REGION`)
-- **Claude Sonnet 5 quirks:** no `temperature` in `inferenceConfig`; responses may include `reasoningContent` blocks before the text — parser collects all `text` blocks
-- `strip_markdown_fences()` for JSON cleanup
-
-### `aws_client`
-
-- S3 client → `AWS_REGION` + optional IAM keys; `certifi` for SSL on Windows
-- Bedrock client → `BEDROCK_REGION`; sets `AWS_BEARER_TOKEN_BEDROCK` when API key is configured
-- Placeholder keys (`your-key`, `changeme`, etc.) treated as unset
-
-### `s3_service`
-
-`upload_bytes` / `download_bytes` / `presigned_url` / `storage_mode()`. `STORAGE_BACKEND=auto` uses local disk under `local_storage/` when AWS keys are placeholders.
-
-### Mapping services
-
-`parse_source_fields` / `parse_target_fields` — read `.csv` or `.xlsx`, match fixed headers case-insensitively (with a small alias list per column), return one dict per row. Raises `ValueError` (→ HTTP 422) if a required column isn't found or the file has no data rows. Source rows: `field_name`, `description`, `key_field` (bool, normalized from `Y/N`/`X`/`TRUE/FALSE`/`1/0`/`yes/no`), `datatype`. Target rows: `sap_table`, `sap_field`, `description`, `table_description`, `datatype`.
-
-### `embedding_service` (mapping)
-
-`embed_texts(list[str]) -> np.ndarray` — **Cohere Embed v4** on Bedrock (`BEDROCK_EMBED_MODEL_ID`, default `cohere.embed-v4:0`) via InvokeModel, same creds as Claude (`BEDROCK_ACCESS_KEY` or IAM). Batches of 96. L2-normalized rows. Falls back to local TF-IDF when `EMBEDDING_BACKEND=local` or no Bedrock credentials.
-
-### `mapping_engine` (mapping)
-
-`top_candidates` — embeds `"{field}: {description}"` for source rows and `"{table}.{field}: {description}"` for target rows, cosine-similarity matrix, returns the top 3 target candidates per source field with a raw `embedding_score` (-1..1) and a `datatype_match_score` (0-100, or `None` if either side's datatype is missing) from `datatype_matcher`.
-
-### `llm_mapping` (mapping)
-
-`rank_candidates` — sends one source field + its top-3 embedding candidates (including target table description, for context) to **Bedrock** (`BEDROCK_MODEL_ID`, default Claude Sonnet 5), gets back the same candidates re-ordered with a `confidence_score` (0-100) and a ~20-30 word `reasoning` each; `datatype_match_score` passes through untouched (not sent to the LLM). JSON-only response. On LLM failure/invalid JSON, the router falls back to embedding-only scoring (`confidence_score = embedding_score * 100`) rather than failing the whole run.
-
-### `chat_service`
-
-Grounded Q&A for dashboard / validation / mapping results. **Claude does not write SQL or call APIs.** `chat_service` loads an allow-listed JSON pack (recent runs, latest completed run + exception sample, mapping candidates + confirmed rows) and `bedrock_llm.chat()` explains it. No pgvector. Off-topic / jailbreak prompts return a fixed refusal.
-
-### `datatype_matcher` (mapping)
-
-`datatype_match_score(source_datatype, target_datatype) -> float | None` — hardcoded SAP-type compatibility groups (e.g. `CHAR`/`STRING`/`TEXT`, `NUMC`/`INT`/`NUMBER`, `DATS`/`DATE`, `CURR`/`DEC`/`FLOAT`, `FLAG`/`BOOLEAN`). Exact match after normalization → 100, same group → 60, otherwise → 0. Returns `None` if either datatype is missing.
-
-### `comparison_file_service` (comparison)
-
-`read_header` / `count_data_rows` / `iter_data_rows` read with openpyxl `read_only=True` so a 200k-row workbook never lands in memory as objects. `AnnotatedResultWriter` streams the report with xlsxwriter in `constant_memory` mode: preload columns in their original order, red fill (`#FFC7CE`, the same red the validation report uses) on every failing cell, and an appended `Comparison_Failure_Detail` column. Cells are written with typed calls (`write_string`, `write_number`, `write_datetime`) because xlsxwriter's generic `write()` runs token detection per cell, which dominates the runtime at this scale.
-
-### `comparison_engine` (comparison)
-
-`build_plan` resolves which columns join the two files and which are compared, from `final_mapping` or from shared column names. `run_comparison` then indexes the postload file by composite key and streams the preload file once — comparing, counting, keeping the worst 50 discrepancies in a bounded heap, and writing the report in the same pass. Values are normalized before comparison (trimmed, integral floats as integers, dates as ISO); differing values that match after dropping case and punctuation are reported as `FORMAT_CHANGE` (info) rather than `VALUE_MISMATCH` (warning). Duplicate business keys in the postload file resolve last-wins.
-
-Measured on 2 × 200,000 rows × 10 columns: ~78s and ~200 MB peak heap, so `execute` stays synchronous.
+On startup: marks stale `running` validation/comparison runs and `processing` mappings as `failed`. Ensures progress columns on `validation_runs` exist.
 
 ---
 
-## Pydantic schemas (`schemas/`)
+## Feature Flows
 
-| Module | Models |
+### Validation
+
+1. Create run with unique name per project.
+2. Upload CSV or XLSX; headers seed `validation_fields`.
+3. Configure rules (`PUT /rules`) or get suggestions (`POST /suggest-rules` — does not write DB).
+4. Execute returns **202**; worker streams rows via `file_stream` + `rules_engine`, writes annotated XLSX with red failing cells and `Validation_Failure_Reason` column.
+5. Composite key uniqueness when ≥2 `flag_key` fields.
+6. Exception sampling: max **5 per error type**, **20 total** → `validation_exceptions`.
+7. Poll `GET /result` for progress (`processedRows`, `totalRows`); download full report via `download-url`.
+
+### Field mapping
+
+1. `POST /mappings/` with `number_range_type` (`internal` \| `external`), source + target files → **202**.
+2. Pipeline: parse → embed → top-3 → LLM re-rank → `mapping_temp`; status → `awaiting_approval`.
+3. Internal number range + key field: skip AI — full target catalog as manual prospects.
+4. User confirms via `POST /confirm`; status → `completed`.
+
+### Comparison
+
+1. Create run, upload paired `.xlsx` files (max 200k rows each).
+2. Optional mapping for column/key resolution.
+3. Execute returns **202**; worker joins on composite business key, compares values with equivalence rules, stores top 50 discrepancies, streams annotated preload report.
+4. `values_equivalent` ignores zero-padding, decimal noise, sign formats, date format differences on keys and values.
+
+### Chat
+
+`chat_service` packs owned project/run/mapping JSON (no SQL from model). Comparison data is marked unavailable in context. Bedrock answers from the pack only; off-topic prompts refused in code.
+
+---
+
+## Services (key behavior)
+
+| Service | Responsibility |
 | --- | --- |
-| `auth.py` | `RegisterRequest`, `LoginRequest`, `UserOut`, `AuthResponse` |
-| `projects.py` | `ProjectCreate`, `ProjectOut` — `id` serialized as `str` |
-| `reports.py` | `ProjectReportOut`, `ReportValidationSection`, `ReportReadiness`, … |
-| `validation.py` | `CreateRunRequest`, `FieldRuleIn`, `RegexGenerateRequest/Response`, `RunDetailOut`, `RunFieldOut` |
-| `mapping.py` | `ConfirmedFieldIn` (`source_field`, `target_field`), `ConfirmMappingRequest` (`fields: list[ConfirmedFieldIn]`) — body for `POST /{run_id}/confirm` |
-| `comparison.py` | `CreateComparisonRequest`, `ExecuteComparisonRequest`, `ComparisonReviewOut`, `ComparisonDiscrepancyOut` — review models are camelCase to match the reconciliation page |
-| `chat.py` | `ChatRequest`, `ChatResponse`, `ChatContextIn`, `ChatTurn` |
-
-Routers import via `from schemas import ...`.
+| `rules_engine.validate_cell` | Types, regex `fullmatch`, keys, dates, email, mobile, case rules |
+| `excel_service` | Streaming validation → XLSX; `Validation_Failure_Reason` column |
+| `regex_generator` | Bedrock → JSON regex; strips `^`/`$` |
+| `bedrock_llm` | API key (httpx) or IAM (boto3); parses Sonnet 5 `reasoningContent` + `text` blocks |
+| `rule_suggester` | Heuristics → DDIC/template embedding match → optional LLM batch; never sets `flag_key` |
+| `comparison_engine` | Composite-key join, `FORMAT_CHANGE` vs `VALUE_MISMATCH`, bounded heap for discrepancies |
+| `s3_service` | `auto` uses local disk when AWS creds are placeholders |
 
 ---
 
-## Local run
+## Tests
+
+```bash
+pytest tests/ -q    # needs Postgres + .env
+```
+
+| File | Focus |
+| --- | --- |
+| `test_suggest_rules.py` | Rule suggester + endpoint |
+| `test_large_file.py` | CSV streaming validation |
+| `test_composite_keys.py` | Composite/single key uniqueness, exception caps |
+| `test_project_report.py` | `GET /api/projects/{id}/report` |
+| `test_comparison.py` | Full comparison API |
+| `test_comparison_equivalence.py` | `values_equivalent`, `canonical_key_part` |
+| `test_chat.py` | Prefilter, context pack, mocked Bedrock |
+| `test_embedding_service.py` | Local embed + mocked Cohere |
+| `test_bedrock_llm.py` | Mocked regex + rank_candidates |
+| `test_run_names.py` | Run naming uniqueness |
+
+---
+
+## Local Run
 
 ```bash
 cd IntelliSAP_MIGR8_Backend
 python -m venv venv
-# Windows:
-.\venv\Scripts\activate
+.\venv\Scripts\activate          # Windows
 pip install -r requirements.txt
-copy .env.example .env   # fill values
+copy .env.example .env
 
-uvicorn main:app --reload --port 8000
+# Fresh DB:
+# psql "%DATABASE_URL%" -f schema.sql
 
-# Option B: apply schema.sql first, then uvicorn
-# psql "$DATABASE_URL" -f schema.sql
+# Existing DB — apply migrations in order (see Migrations section)
 
-# Existing DB with run_name / old defaults:
-# psql "$DATABASE_URL" -f migrations/001_validation_run_names.sql
-
-# Existing DB missing number-range/key-field columns for field mapping:
-# psql "$DATABASE_URL" -f migrations/002_field_mapping_key_and_number_range.sql
-# (or: python scripts/apply_002_field_mapping_migration.py)
-
-# Comparison tables (run after 002):
-# psql "$DATABASE_URL" -f migrations/003_comparison_runs.sql
-# (or: python scripts/apply_comparison_migration.py)
+uvicorn main:app --reload --port 8000 --reload-exclude "venv"
 ```
 
 Smoke checks:
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","storage":"local|s3","llm":"bedrock","model":"us.anthropic.claude-sonnet-5","bedrock_region":"us-east-1"}
-
-python scripts/test_regex_bedrock.py   # needs BEDROCK_ACCESS_KEY or IAM Bedrock access
+python scripts/test_regex_bedrock.py
 ```
 
-Tests (needs Postgres + `.env`):
-
-```bash
-pytest tests/ -q      # scope to tests/; scripts/test_*.py are manual Bedrock probes
-pytest tests/test_comparison.py -q
-```
+**Tip:** Use `--reload-exclude "venv"` so `pip install` while the server is running does not trigger reload storms on Windows.
 
 ---
 
 ## Decisions & Conventions
 
-1. **Bearer JWT** in `Authorization` header — no server-side session store.
-2. **CamelCase in auth JSON** (`fullName`); field rules use snake_case on the wire.
-3. **Async execute** for validation and comparison — `POST .../execute` returns **202** and a worker writes progress; poll `GET` until `completed`.
-4. **`schema.sql` is source of truth** for constraints; SQLAlchemy `create_all` is a hackathon shortcut.
-5. **Never log secrets** from `.env`.
-6. Keep routers thin; business logic in `services/`.
-7. **bcrypt directly** — avoid passlib + bcrypt 5.x issues on Windows.
-8. **Always `str(uuid)` in API responses** when schema field is `str`.
-9. **`AWS_REGION` ≠ `BEDROCK_REGION`** — S3/RDS region vs Bedrock inference profile endpoint.
-10. **Rule 5 is LLM-only** — Bedrock generates every custom regex from plain English.
-11. **Composite keys** — ≥2 `flag_key` fields → tuple uniqueness, not per-column.
-12. **Exception cap** — diverse error types in UI despite many failures in the file.
-13. **Bedrock API key vs IAM** — API key uses httpx REST; IAM uses boto3. S3 always uses IAM keys/role.
-14. **Mapping confirmation is per-field** — upsert on `(mapping_id, source_field)`.
-15. **Storage is shared and backend-agnostic** — every module (validation and comparison) writes through `services/s3_service`, so `STORAGE_BACKEND=auto` puts files in S3 whenever credentials resolve and only falls back to `local_storage/` when they don't.
-16. **Comparison is xlsx in, xlsx out** — no CSV path anywhere, capped at 200,000 rows per file, so reads and writes can both stream and the report keeps Excel formatting (red cells).
-17. **The comparison business key is composite by design** — `final_mapping.key` is a plain boolean with no uniqueness constraint, and every flagged field contributes one part of the join key.
+1. Bearer JWT — no server-side session store.
+2. Async execute for validation, mapping, and comparison — **202** + poll result endpoints.
+3. `schema.sql` is source of truth; `create_all` only when `users` table missing.
+4. `AWS_REGION` ≠ `BEDROCK_REGION`.
+5. Composite keys — ≥2 `flag_key` fields → tuple uniqueness.
+6. Exception cap in DB — diverse samples for UI; full detail in Excel download.
+7. Mapping confirmation is per-field upsert on `(mapping_id, source_field)`.
+8. Comparison is xlsx in/out; 200k row cap; streaming reads/writes.
+9. Keep routers thin; business logic in `services/`.
+10. Always `str(uuid)` in API responses when schema field is `str`.
 
 ---
 
 ## Open Questions / TBD
 
-- Background job for `execute` (Celery / RQ) if uvicorn `--reload` or multiple workers start duplicating jobs
+- Celery/RQ if multiple uvicorn workers need isolated job execution
 - Password reset
-- Stricter alignment of auto-created tables with `schema.sql` CHECKs
-- Server-side auth (httpOnly cookie) so results can SSR — frontend currently uses Bearer + readable cookie for middleware
-- Drop unused `passlib` from `requirements.txt` once confirmed unused
-- Field mapping: batch multiple source fields per LLM call (or queue+poll) instead of one call each, once field-list sizes grow
-- Field mapping: "Fetch from SAP" live target-table lookup isn't implemented — target field list is upload-only for now
-- Field mapping: `datatype_match_score` uses a hardcoded compatibility matrix (`services/datatype_matcher.py`); revisit if SAP type coverage needs to grow
-- Field mapping: `GET /{run_id}/result` now surfaces `confirmedTargetField` per row and `GET /{run_id}/confirmed` reads confirmed rows, but there's still no endpoint to un-confirm/delete a single `final_mapping` row — only upsert via `/confirm`
-- Remove unused `groq` / `passlib` from `requirements.txt` once venv is rebuilt
-- Field mapping: batch multiple source fields per LLM call for large files
-- Drop debug `print` in `rules_engine.validate_cell` before production
-- Comparison: `execute` is synchronous (~78s at the 200k-row cap); move to a queue + poll if files grow past that
-- Comparison keys ride on the source file's Key Field flag, so a preload/postload pair can only use a mapping whose source schema had keys flagged
+- `validation_row_results` table if UI needs paginated full-row API without Excel download
+- Un-confirm / delete single `final_mapping` row endpoint
+- Live SAP table fetch for mapping target fields (upload-only today)
+- `schema.sql` CHECK for `mappings.status` should include `awaiting_approval`
 
 ---
 
 ## Session Log
 
+### 2026-08-14 — Project.md refresh
+
+- Synced docs with current codebase: async jobs for all three pillars, `job_queue`, `mapping_pipeline`, `rule_suggester`, `file_stream` streaming validation, migrations 003_run_progress + 004_validation_rule_templates, mapping `awaiting_approval` + `/stats` + `PATCH` + `/target-fields`.
+
 ### 2026-08-14 — Large-file validation
 
-- `POST /api/runs/{id}/execute` returns **202**; in-process worker validates and writes a full annotated XLSX.
-- Progress columns on `validation_runs`: `processed_rows`, `total_rows`, `error_message` (`migrations/003_run_progress.sql`).
-- Streaming engine: CSV/XLSX via `file_stream` + `xlsxwriter` (no in-place openpyxl mutate).
-- Tests: `tests/test_large_file.py` plus existing composite-key tests.
+- `POST /api/runs/{id}/execute` returns **202**; worker streams CSV/XLSX and writes annotated XLSX.
+- Progress columns: `processed_rows`, `total_rows`, `error_message`.
 
-### 2026-08-14 — Comparison ignores re-spelled values
+### 2026-08-14 — Comparison value equivalence
 
-- `comparison_engine.values_equivalent` treats a value as unchanged when only its spelling moved: zero padding from ALPHA conversion, decimal/grouping noise, a leading, trailing or parenthesised sign, and date/datetime format (see the equivalence table in the API map). Such cells produce no discrepancy, no red fill, and count toward `matchedRecords`.
-- `canonical_key_part` applies the zero-padding rule to the business key as well, so a preload `100045` joins a postload `0000100045` instead of both rows reporting as missing. Keys deliberately use the numeric rule only.
-- Numbers are parsed with `Decimal` (never float) so 18-digit SAP keys compare exactly; exponent notation is excluded so ids like `1E5` stay text. Both parsers sit behind cheap character-set/regex gates, and `classify_difference` only reaches them once a cell has already failed exact string equality, so the 200k-row path is unaffected.
-- Three tests added in `tests/test_comparison.py` (padded keys + values, reformatted numbers/dates/signs, and a guard that `1000` vs `1000.01` and `0` vs blank still fail).
+- `values_equivalent` + `canonical_key_part` for zero-padding, decimals, signs, dates.
+- Tests in `test_comparison.py`, `test_comparison_equivalence.py`.
 
-### 2026-08-13 — Results chatbot (grounded Q&A)
+### 2026-08-13 — Results chatbot, comparison, field mapping
 
-- `POST /api/chat/` packs owned validation/mapping/dashboard JSON; Claude Sonnet 5 answers from that pack only.
-- Claude does not generate SQL or call APIs. Off-topic questions are refused in code.
-- `GET /api/mappings/` lists runs across projects (optional `project_id`).
-- Tests: `tests/test_chat.py`.
+- `POST /api/chat/` grounded assistant.
+- Comparison module: `comparison_runs`, `comparison_discrepancies`, async execute.
+- Field mapping: `number_range_type`, `key_field`, `final_mapping.key`, `awaiting_approval`.
 
-### 2026-08-13 — Comparison merged onto the shared key-field column
+### 2026-08-13 — Bedrock region + Sonnet 5
 
-- Resolved the overlap between the comparison feature and the number-range work: the comparison business key now reads `final_mapping.key` (set from the source file's Key Field flag on confirm) instead of the parallel `is_key` boolean the comparison branch had added. `ConfirmedFieldIn` no longer takes a key flag — nothing outside the mapping pipeline decides which fields are keys.
-- The comparison migration became `003_comparison_runs.sql` (the comparison branch had also numbered its file 002) and now only adds the two tables plus a partial index on `final_mapping(mapping_id) WHERE key`; `scripts/apply_comparison_migration.py` refuses to run until 002 has added the column.
-- Both branches had added `GET /api/mappings/`; they are now one endpoint that keeps the `mappingRunId`/`mappingName` response keys and adds `confirmedFieldCount`, `keyFieldCount`, `projectId`, `projectName`. `project_id` is optional so the cross-project activity list can reuse it.
-- `schema.sql` picked up the three columns 002 adds (`mappings.number_range_type`, `mapping_temp.key_field`, `final_mapping.key`), which the migration had introduced without updating the canonical DDL.
-- Comparison files verified landing in S3 (`comparisons/{run_id}/{preload,postload,result}/`) — no comparison-specific storage code, it goes through `services/s3_service` exactly like validation.
-
-### 2026-08-13 — Number-range/key-field mapping + confirmation status catch-up
-
-- Documents a feature that had already landed in code but was never written up here: `POST /api/mappings/?project_id=` now requires a `number_range_type` Form field (`internal`\|`external`); `mapping_temp.key_field`/`final_mapping.key` track which source fields are key fields (`migrations/002_field_mapping_key_and_number_range.sql`).
-- For key fields under an `internal` number range, `mapping_engine`'s pipeline is bypassed for that row — `routers/mapping.py`'s `create_mapping_run` hands back the full target catalog as `prospects` (datatype match score only, no embedding/LLM confidence) so the frontend can present a manual picker instead of an AI suggestion.
-- `GET /{run_id}/result` (`_serialize` in `routers/mapping.py`) now also joins `final_mapping` and adds `confirmedTargetField` per row (`null` if that source field hasn't been confirmed yet), so reopening a run can show which fields are already approved.
-- No breaking change to `POST /{run_id}/confirm`'s contract — it now also copies `mapping_temp.key_field` into `final_mapping.key` on upsert.
-
-### 2026-08-13 — Preload vs postload comparison
-
-- New tables `comparison_runs` + `comparison_discrepancies`, joined on the composite business key a mapping declares (`migrations/003_comparison_runs.sql`, applied by `scripts/apply_comparison_migration.py`).
-- New router `routers/comparison.py` (`/api/comparisons`): create, xlsx-only paired upload, available mappings, synchronous execute, review payload, download URL.
-- New services `comparison_file_service` (openpyxl `read_only` reads, xlsxwriter `constant_memory` annotated report) and `comparison_engine` (composite-key join, value comparison, bounded top-50 discrepancies).
-- `/api/mappings/` list and `/api/mappings/{id}/confirmed` added.
-- Added `XlsxWriter==3.2.9` to `requirements.txt` and `tests/test_comparison.py` (14 tests covering both mapping modes, composite keys, discrepancy types, the 50 cap, the report layout, and ownership).
-
-### 2026-08-13 — Field mapping feature (source → SAP target)
-### 2026-08-13 — Bedrock region + API key + Sonnet 5 response parsing
-
-- Added `BEDROCK_REGION` (default `us-east-1`) separate from `AWS_REGION` for S3/RDS.
-- `BEDROCK_ACCESS_KEY` (`ABSK…`) → httpx REST with bearer token; IAM path unchanged via boto3.
-- `bedrock_llm`: omit deprecated `temperature`; parse `reasoningContent` + `text` blocks from Sonnet 5.
-- `/health` returns `bedrock_region`, `storage`, `llm`, `model`.
-- Scripts: `test_regex_bedrock.py`, `probe_bedrock_profiles.py`, `check_aws_access.py`.
-- `generate-regex` returns **422** with `{ message, reason }` on failure.
-
-### 2026-08-13 — Composite key validation
-
-- `excel_service`: when ≥2 fields have `flag_key`, enforce composite uniqueness across the row tuple.
-- `normalize_key()` matches Excel int/float (`1` vs `1.0`).
-- Exception sampling: max 5 per error type, 20 total stored.
-- Tests: `tests/test_composite_keys.py`.
-
-### 2026-08-13 — Field mapping feature
-
-- Router `routers/mapping.py`: parse → embed → top-3 → Bedrock re-rank → `mapping_temp` / `final_mapping`.
-- Services: `file_parser`, `embedding_service`, `mapping_engine`, `llm_mapping`, `datatype_matcher`.
-
-### 2026-08-13 — Bedrock LLM migration (Groq removed from code)
-
-- `services/bedrock_llm.py` for regex + mapping; default `us.anthropic.claude-sonnet-5`.
-- `services/aws_client.py` for IAM-role-aware boto3.
-- Tests: `tests/test_bedrock_llm.py` (mocked).
-
-### 2026-08-13 — Project report + cross-project runs + run names
-
-- `GET /api/projects/{project_id}/report` — `schemas/reports.py`, `tests/test_project_report.py`.
-- `GET /api/runs/` — cross-project activity list with `project_id` / `project_name`.
-- Validation run `name` unique per project; migration `001_validation_run_names.sql`.
-
-### 2026-08-13 — Logout + auth
-
-- `POST /api/auth/logout` — client clears JWT (stateless).
-
-### 2026-08-12 — Windows / Python 3.13 fixes
-
-- `psycopg2-binary` 2.9.11, direct bcrypt, `ProjectOut` UUID → str coercion.
-- Schemas split into `schemas/` package.
-
-### 2026-08-13 — Date validation + regex hardening
-
-- Excel `datetime`/`date` cells accepted; `re.fullmatch` for regex rules.
-- Repo: https://github.com/Shukla0708/migr8-AI-backend
+- `BEDROCK_REGION` separate from `AWS_REGION`; `BEDROCK_ACCESS_KEY` REST path.
+- Sonnet 5: no `temperature`; parse `reasoningContent` + `text` blocks.
 
 ---
 
@@ -607,5 +418,5 @@ When you change the backend, update this file if you touch:
 - [ ] New route or response shape
 - [ ] Model / `schema.sql` change (+ migration if needed)
 - [ ] New env var / `.env.example`
-- [ ] Service behavior (rules, Excel, S3, Bedrock)
+- [ ] Service behavior (rules, Excel, S3, Bedrock, jobs)
 - [ ] Test file added or renamed
