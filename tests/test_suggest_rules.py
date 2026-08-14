@@ -75,6 +75,34 @@ def test_heuristic_email_does_not_call_bedrock():
     assert sug["rule_source"] == "ai"
 
 
+def test_catalog_covers_official_sap_fields():
+    names = {item["name"] for item in SEED_TEMPLATES}
+    assert "vbeln" in names
+    assert "vkorg" in names
+    assert "smtp_addr" in names
+    assert len(SEED_TEMPLATES) > 500
+    vbeln = next(item for item in SEED_TEMPLATES if item["name"] == "vbeln")
+    assert vbeln["data_type"] == "char"
+    assert vbeln["max_length"] == 10
+    ebeln = next(item for item in SEED_TEMPLATES if item["name"] == "ebeln")
+    assert ebeln["data_type"] == "char"
+    assert ebeln["max_length"] == 10
+
+
+def test_ebeln_exact_match_is_char10():
+    result = rule_suggester.suggest_rules(
+        [{"field_name": "ebeln", "samples": ["4500000123", "4500000124"]}],
+        SEED_TEMPLATES,
+        embed_fn=_boom,
+        chat_fn=_boom,
+        regex_fn=_boom,
+    )
+    sug = result["suggestions"][0]
+    assert sug["data_type"] == "char"
+    assert sug["max_length"] == 10
+    assert sug["suggestion_source"] == "catalog"
+
+
 def test_vbeln_is_char10_not_int():
     result = rule_suggester.suggest_rules(
         [{"field_name": "vbeln", "samples": ["0005000012", "0005000013", "0005000014"]}],

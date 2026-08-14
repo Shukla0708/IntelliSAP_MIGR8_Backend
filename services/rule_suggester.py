@@ -14,6 +14,7 @@ import numpy as np
 
 from services import bedrock_llm, embedding_service, regex_generator
 from services.rule_templates import SEED_TEMPLATES, embed_text
+from services.sap_ddic import EMBED_PRIORITY_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def suggest_rules(
 
     if pending:
         try:
-            retrieved = _retrieve(pending, catalog, embed)
+            retrieved = _retrieve(pending, _embed_catalog(catalog), embed)
         except Exception:
             logger.exception("catalog embedding retrieve failed")
             warnings.append(
@@ -309,6 +310,19 @@ def _synthetic(**kwargs: Any) -> dict[str, Any]:
     }
     base.update(kwargs)
     return base
+
+
+def _embed_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Embedding retrieve uses core/generic templates only.
+
+    Exact alias match still sees the full DDIC catalog (thousands of fields).
+    Sending every CHAR field to Cohere would drown similar English headers.
+    """
+    subset = [
+        item for item in catalog
+        if (item.get("priority") or 9999) <= EMBED_PRIORITY_MAX
+    ]
+    return subset or catalog
 
 
 def _retrieve(

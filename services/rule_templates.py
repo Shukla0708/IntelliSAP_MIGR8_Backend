@@ -1,7 +1,9 @@
-"""Curated SAP validation-rule catalog (KNA1 / LFA1 / MARA / BKPF).
+"""SAP validation-rule catalog.
 
-This list is the source of truth. The DB table is a cache for ops; if it is
-empty the suggester uses these rows in memory. Templates never set flag_key.
+DDIC fields come from data/sap_ddic_catalog.json (public table dictionaries).
+GENERIC_TEMPLATES cover English spreadsheet headers. The DB table is a cache
+for ops; suggest-rules uses the in-code list so CHAR lengths cannot go stale.
+Templates never set flag_key.
 """
 from __future__ import annotations
 
@@ -232,8 +234,12 @@ GENERIC_TEMPLATES: list[dict[str, Any]] = [
 ]
 
 
+_DDIC_TEMPLATES = templates_from_ddic()
+_DDIC_NAMES = {item["name"] for item in _DDIC_TEMPLATES}
 # Official SAP CHAR/NUMC lengths win over sample-based guesses (VBELN is CHAR 10, not INT).
-SEED_TEMPLATES: list[dict[str, Any]] = templates_from_ddic() + GENERIC_TEMPLATES
+SEED_TEMPLATES: list[dict[str, Any]] = _DDIC_TEMPLATES + [
+    item for item in GENERIC_TEMPLATES if item["name"] not in _DDIC_NAMES
+]
 
 
 def embed_text(template: dict[str, Any]) -> str:
@@ -251,12 +257,12 @@ def load_templates(db: Session | None) -> list[dict[str, Any]]:
 
 def seed_templates(db: Session) -> int:
     """Upsert SEED_TEMPLATES into validation_rule_templates. Returns row count."""
+    existing = {
+        row.name: row
+        for row in db.query(ValidationRuleTemplate).all()
+    }
     for item in SEED_TEMPLATES:
-        row = (
-            db.query(ValidationRuleTemplate)
-            .filter(ValidationRuleTemplate.name == item["name"])
-            .first()
-        )
+        row = existing.get(item["name"])
         if row is None:
             db.add(ValidationRuleTemplate(**item))
             continue
