@@ -8,6 +8,8 @@ from schemas.validation import (
     RegexGenerateResponse,
     RunDetailOut,
     RunFieldOut,
+    SuggestRulesRequest,
+    SuggestRulesResponse,
 )
 from schemas.mapping import ConfirmedFieldIn, ConfirmMappingRequest, RenameMappingRequest
 from schemas.comparison import (
@@ -32,6 +34,8 @@ __all__ = [
     "RegexGenerateResponse",
     "RunDetailOut",
     "RunFieldOut",
+    "SuggestRulesRequest",
+    "SuggestRulesResponse",
     "ConfirmedFieldIn",
     "ConfirmMappingRequest",
     "RenameMappingRequest",
