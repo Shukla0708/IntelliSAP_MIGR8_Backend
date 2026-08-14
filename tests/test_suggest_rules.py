@@ -90,6 +90,21 @@ def test_vbeln_is_char10_not_int():
     assert sug["suggestion_source"] == "catalog"
 
 
+def test_never_emits_int_for_digit_samples():
+    result = rule_suggester.suggest_rules(
+        [
+            {"field_name": "vbeln", "samples": ["8000000123", "8000000124", "8000000125"]},
+            {"field_name": "sales org", "samples": ["1000", "1000", "2000"]},
+        ],
+        SEED_TEMPLATES,
+        embed_fn=_boom,
+        chat_fn=_boom,
+        regex_fn=_boom,
+    )
+    assert all(row["data_type"] != "int" for row in result["suggestions"])
+    assert all(row["data_type"] == "char" for row in result["suggestions"])
+
+
 def test_sales_org_and_distr_chan_use_sap_char_lengths():
     result = rule_suggester.suggest_rules(
         [

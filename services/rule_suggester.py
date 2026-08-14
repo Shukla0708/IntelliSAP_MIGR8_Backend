@@ -207,8 +207,9 @@ def _heuristic(name: str, samples: list[str]) -> dict[str, Any] | None:
         numeric = _samples_numeric_kind(samples)
         if numeric == "decimal":
             return _template_named("amount") or _synthetic(data_type="decimal", decimal_length=2)
+        # SAP does not store identifiers as INT. Digit-only qty-like values stay decimal.
         if numeric == "int":
-            return _synthetic(data_type="int")
+            return _template_named("quantity") or _synthetic(data_type="decimal")
     return None
 
 
@@ -418,6 +419,12 @@ def _finalize(
             logger.info("regex generation failed for field %s; omitting pattern", field_name)
             regex = None
 
+    data_type = template.get("data_type") or "string"
+    max_length = template.get("max_length")
+    # CHAR/NUMC keys (VBELN, VKORG, …) are never INT, even when samples are digits.
+    if data_type == "int":
+        data_type = "char"
+
     return {
         "field_name": field_name,
         "flag_key": False,
@@ -428,8 +435,8 @@ def _finalize(
         "flag_date": flag_date,
         "flag_special_chars": bool(template.get("flag_special_chars")),
         "case_format": template.get("case_format"),
-        "data_type": template.get("data_type") or "string",
-        "max_length": template.get("max_length"),
+        "data_type": data_type,
+        "max_length": max_length,
         "decimal_length": template.get("decimal_length"),
         "regex": regex,
         "regex_prompt": regex_prompt,
