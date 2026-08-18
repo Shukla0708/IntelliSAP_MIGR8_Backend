@@ -23,6 +23,7 @@ from services.aws_client import (
     _has_explicit_credentials,
     get_bedrock_runtime_client,
 )
+from services import llm_cache, llm_usage
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _COHERE_BATCH = 96
@@ -47,6 +48,30 @@ def embed_texts(texts: list[str]) -> np.ndarray:
 
 
 def _embed_texts_cohere(texts: list[str]) -> np.ndarray:
+    model_id = settings.bedrock_embed_model_id
+    cached, missing = llm_cache.get_embeddings(model_id, texts)
+    if missing:
+        to_embed = [texts[i] for i in missing]
+        fresh = _embed_texts_cohere_uncached(to_embed)
+        llm_cache.put_embeddings(model_id, to_embed, fresh)
+        llm_usage.record(
+            model_id=model_id,
+            purpose="embed",
+            input_tokens=sum(max(len(t), 1) for t in to_embed),
+        )
+        for idx, vec in zip(missing, fresh):
+            cached[idx] = vec
+    dim = next((v.shape[0] for v in cached if v is not None), 0)
+    rows = []
+    for vec in cached:
+        if vec is None:
+            rows.append(np.zeros(dim, dtype=np.float32))
+        else:
+            rows.append(vec)
+    return np.vstack(rows) if rows else np.empty((0, 0), dtype=np.float32)
+
+
+def _embed_texts_cohere_uncached(texts: list[str]) -> np.ndarray:
     chunks: list[np.ndarray] = []
     for start in range(0, len(texts), _COHERE_BATCH):
         batch = [t if (t or "").strip() else " " for t in texts[start : start + _COHERE_BATCH]]

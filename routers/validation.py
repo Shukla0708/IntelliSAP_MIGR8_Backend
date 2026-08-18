@@ -7,9 +7,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db.database import get_db
-from db.models import User, ValidationRun, ValidationField, ValidationException, ValidationProject
+from db.models import (
+    LearnedFieldRule,
+    User,
+    ValidationException,
+    ValidationField,
+    ValidationProject,
+    ValidationRun,
+)
 from auth import get_current_user
-from services import s3_service, regex_generator, file_stream, job_queue, rule_suggester, rule_templates
+from services import s3_service, regex_generator, file_stream, job_queue, rule_suggester, rule_templates, learned_rules
 from schemas import (
     CreateRunRequest,
     FieldRuleIn,
@@ -226,15 +233,20 @@ def save_rules(run_id: uuid.UUID, payload: list[FieldRuleIn], db: Session = Depe
         row.decimal_length = f.decimal_length
         row.regex_prompt = f.regex_prompt
         row.rule_source = f.rule_source or "default"
-        # If the user wrote a plain-English rule, always ask Bedrock for the regex
-        # so Rule 5 stays LLM-driven even if they didn't click Generate in the UI.
         if f.regex_prompt and f.regex_prompt.strip():
             try:
                 row.regex = regex_generator.generate_regex(f.field_name, f.regex_prompt)
             except Exception:
-                row.regex = f.regex  # fall back to any pattern the UI already has
+                row.regex = f.regex
         else:
             row.regex = f.regex
+        if row.rule_source == "user":
+            learned_rules.upsert_rule_from_field(db, row, current_user)
+        elif row.rule_source in ("ai", "learned"):
+            key = learned_rules.canonical_key(row.field_name)
+            existing = learned_rules.lookup_rule(db, row.field_name)
+            if existing and existing.canonical_key == key:
+                learned_rules.bump_rule_use(db, key)
 
     db.query(ValidationRun).filter_by(id=run_id).update({"status": "rules_configured"})
     db.commit()
@@ -254,9 +266,14 @@ def suggest_rules_route(
         raise HTTPException(400, "Too many fields (max 500)")
 
     templates = rule_templates.load_templates(db)
+    learned_map = {
+        row.canonical_key: learned_rules.rule_to_template(row)
+        for row in db.query(LearnedFieldRule).filter(LearnedFieldRule.active.is_(True)).all()
+    }
     result = rule_suggester.suggest_rules(
         [{"field_name": f.field_name, "samples": f.samples} for f in payload.fields],
         templates,
+        learned=learned_map,
     )
     return SuggestRulesResponse(
         suggestions=result["suggestions"],

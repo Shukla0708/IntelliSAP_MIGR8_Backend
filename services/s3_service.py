@@ -109,14 +109,15 @@ def download_to_temp(key: str, suffix: str = "") -> Path:
     return download_to_path(key, Path(name))
 
 
-def presigned_url(key: str, expires: int = 3600) -> str:
+def presigned_url(key: str, expires: int | None = None) -> str:
+    ttl = expires if expires is not None else settings.s3_presign_ttl_seconds
     if _use_local():
         base = settings.public_api_base_url.rstrip("/")
         return f"{base}/api/local-files/{quote(key, safe='')}"
     return get_s3_client().generate_presigned_url(
         "get_object",
         Params={"Bucket": settings.s3_bucket, "Key": key},
-        ExpiresIn=expires,
+        ExpiresIn=ttl,
     )
 
 

@@ -13,8 +13,10 @@ from typing import Any, Callable
 import numpy as np
 
 from services import bedrock_llm, embedding_service, regex_generator
+from config import settings
 from services.rule_templates import SEED_TEMPLATES, embed_text
 from services.sap_ddic import EMBED_PRIORITY_MAX
+from services import learned_rules as learned_rules_mod
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ SYSTEM_PROMPT = (
     "You pick validation rule templates for source-file columns in an SAP "
     "data-migration tool. Each field has a name, sample values, and up to 3 "
     "candidate templates already ranked by embedding similarity. "
+    "Candidate 1 is a human-confirmed org standard when preferred is true. "
+    "Prefer it unless the sample values contradict it (length, type, pattern). "
     "Return ONLY JSON: {\"picks\": [{\"field_name\": \"...\", "
     "\"template\": \"<template name or null>\"}]}. "
     "Use a template name from the candidates, or null if none fit. "
@@ -60,6 +64,7 @@ def suggest_rules(
     embed_fn: Callable[[list[str]], np.ndarray] | None = None,
     chat_fn: Callable[..., str] | None = None,
     regex_fn: Callable[[str, str], str] | None = None,
+    learned: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return {suggestions: [...], warning: str|None}. Does not write validation_fields."""
     catalog = templates if templates is not None else [dict(t) for t in SEED_TEMPLATES]
@@ -67,6 +72,7 @@ def suggest_rules(
     embed = embed_fn or embedding_service.embed_texts
     chat = chat_fn or bedrock_llm.chat
     make_regex = regex_fn or regex_generator.generate_regex
+    learned = learned or {}
 
     suggestions: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
@@ -79,6 +85,20 @@ def suggest_rules(
             continue
         seen.add(name)
         samples = _clean_samples(raw.get("samples") or [])
+        key = learned_rules_mod.canonical_key(name, catalog)
+        learned_tmpl = learned.get(key)
+        if learned_tmpl:
+            if learned_rules_mod.samples_fit(learned_tmpl, samples):
+                suggestions.append(
+                    _finalize(name, learned_tmpl, "learned", make_regex, learned_regex=learned_tmpl.get("regex"))
+                )
+                continue
+            pending.append({
+                "field_name": name,
+                "samples": samples,
+                "learned": learned_tmpl,
+            })
+            continue
         exact = _exact_alias_match(name, catalog)
         if exact is not None:
             suggestions.append(_finalize(name, exact, "catalog", make_regex))
@@ -103,19 +123,37 @@ def suggest_rules(
             retrieved = []
 
         for field, cands in retrieved:
+            learned_tmpl = field.get("learned")
+            if learned_tmpl:
+                cands = [(learned_tmpl, learned_rules_mod.LEARNED_SCORE), *cands][:TOP_K]
             if not cands:
                 continue
             top_score = cands[0][1]
             second = cands[1][1] if len(cands) > 1 else 0.0
-            confident = top_score >= SIM_CONFIDENT and (top_score - second) >= 0.08
+            if learned_tmpl and learned_rules_mod.samples_fit(learned_tmpl, field["samples"]):
+                catalog_hits.append((field, cands))
+                continue
+            confident = (
+                not learned_tmpl
+                and top_score >= SIM_CONFIDENT
+                and (top_score - second) >= 0.08
+            )
             if confident:
                 catalog_hits.append((field, cands))
-            elif top_score >= SIM_FLOOR:
+            elif top_score >= SIM_FLOOR or learned_tmpl:
                 ambiguous.append((field, cands))
 
         for field, cands in catalog_hits:
+            source = "learned" if field.get("learned") else "catalog"
+            tmpl = field["learned"] if source == "learned" else cands[0][0]
             suggestions.append(
-                _finalize(field["field_name"], cands[0][0], "catalog", make_regex)
+                _finalize(
+                    field["field_name"],
+                    tmpl,
+                    source,
+                    make_regex,
+                    learned_regex=tmpl.get("regex") if source == "learned" else None,
+                )
             )
 
         llm_batch = ambiguous[:MAX_LLM_FIELDS]
@@ -176,7 +214,7 @@ def merge_into_existing(
             continue
         merged = {**row, **suggestion}
         merged["flag_key"] = bool(row.get("flag_key"))
-        merged["rule_source"] = "ai"
+        merged["rule_source"] = suggestion.get("rule_source") or "ai"
         out.append(merged)
     return out
 
@@ -372,6 +410,7 @@ def _llm_pick(
                         "template": tmpl["name"],
                         "aliases": tmpl.get("aliases") or "",
                         "similarity": round(score, 4),
+                        "preferred": bool(tmpl.get("learned")),
                     }
                     for tmpl, score in cands
                 ],
@@ -379,7 +418,13 @@ def _llm_pick(
             for field, cands in batch
         ]
     }
-    raw = chat_fn(SYSTEM_PROMPT, json.dumps(payload), max_tokens=2000)
+    raw = chat_fn(
+        SYSTEM_PROMPT,
+        json.dumps(payload),
+        max_tokens=1500,
+        model_id=settings.bedrock_model_id,
+        purpose="rule_pick",
+    )
     raw = bedrock_llm.strip_markdown_fences(raw)
     data = json.loads(raw)
     picks = data.get("picks") if isinstance(data, dict) else data
@@ -414,6 +459,7 @@ def _finalize(
     template: dict[str, Any],
     source: str,
     regex_fn: Callable[[str, str], str],
+    learned_regex: str | None = None,
 ) -> dict[str, Any]:
     flag_email = bool(template.get("flag_email"))
     flag_mobile = bool(template.get("flag_mobile"))
@@ -424,9 +470,9 @@ def _finalize(
     elif flag_mobile:
         flag_date = False
 
-    regex = None
+    regex = learned_regex or None
     regex_prompt = template.get("regex_prompt") or None
-    if regex_prompt:
+    if regex is None and regex_prompt:
         try:
             regex = regex_fn(field_name, regex_prompt)
         except Exception:
@@ -454,7 +500,7 @@ def _finalize(
         "decimal_length": template.get("decimal_length"),
         "regex": regex,
         "regex_prompt": regex_prompt,
-        "rule_source": "ai",
+        "rule_source": "learned" if source == "learned" else "ai",
         "suggestion_source": source,
         "template_name": template.get("name"),
     }

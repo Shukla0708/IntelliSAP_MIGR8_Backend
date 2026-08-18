@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, time
 from pathlib import Path
@@ -78,6 +79,12 @@ def run_validation_from_path(
                 item["_compiled_regex"] = None
         else:
             item["_compiled_regex"] = None
+        name = str(item.get("field_name") or "")
+        dt = str(item.get("data_type") or "").lower()
+        max_len = item.get("max_length") or 0
+        item["_low_cardinality"] = dt in ("char", "numc", "cuky", "lang") and 0 < max_len <= 5
+        if name.upper() in ("BUKRS", "WAERS", "SPRAS", "LAND1", "VKORG", "VTWEG"):
+            item["_low_cardinality"] = True
         compiled_configs.append(item)
 
     ruled_columns: list[tuple[int, str, dict]] = []
@@ -99,6 +106,12 @@ def run_validation_from_path(
     errors_by_type: dict[str, int] = {}
     exceptions: list[dict] = []
     stored_rows_by_type: dict[str, set[int]] = {}
+    rare_counts: dict[str, Counter] = {
+        cfg["field_name"]: Counter()
+        for cfg in compiled_configs
+        if cfg.get("_low_cardinality")
+    }
+    rare_capped: set[str] = set()
 
     out_handle, out_name = tempfile.mkstemp(suffix=".xlsx")
     os.close(out_handle)
@@ -132,11 +145,21 @@ def run_validation_from_path(
             cell_value = _empty_to_none(values[col_idx])
             seen_keys = None if composite_keys else seen_keys_by_field.get(field_name)
             reasons = validate_cell(cell_value, cfg, seen_keys)
-            if reasons:
+            error_reasons = [r for r in reasons if not str(r).startswith("anomaly_")]
+            warn_reasons = [r for r in reasons if str(r).startswith("anomaly_")]
+            if cfg.get("_low_cardinality") and cfg["field_name"] not in rare_capped:
+                raw_key = normalize_key(cell_value)
+                if raw_key:
+                    bucket = rare_counts[cfg["field_name"]]
+                    if len(bucket) < 10_000:
+                        bucket[raw_key] += 1
+                    else:
+                        rare_capped.add(cfg["field_name"])
+            if error_reasons:
                 row_has_error = True
                 failing_cols.add(col_idx)
                 is_critical = cfg["flag_mandatory"] or cfg["flag_key"]
-                for reason in reasons:
+                for reason in error_reasons:
                     row_reasons.append(f"{field_name}: {reason}")
                     total_errors += 1
                     errors_by_field[field_name] = errors_by_field.get(field_name, 0) + 1
@@ -152,6 +175,15 @@ def run_validation_from_path(
                         "error_type": reason,
                         "severity": "error" if is_critical else "warning",
                     })
+            for reason in warn_reasons:
+                _try_store_exception(exceptions, stored_rows_by_type, {
+                    "row_number": excel_row,
+                    "field_name": field_name,
+                    "actual_value": str(cell_value) if cell_value is not None else "",
+                    "expected_value": "Expected domain value",
+                    "error_type": reason,
+                    "severity": "warning",
+                })
 
         if composite_keys:
             dup_count, key_cols = _flag_duplicate_composite_values(
@@ -199,6 +231,28 @@ def run_validation_from_path(
         for i, (label, count) in enumerate(errors_by_type.items())
     ]
 
+    rare_anomalies: list[dict] = []
+    for field_name, counter in rare_counts.items():
+        if field_name in rare_capped or not counter:
+            continue
+        threshold = max(1, int(total_rows * 0.001))
+        rare_values = [value for value, count in counter.items() if count < threshold]
+        if rare_values:
+            rare_anomalies.append({
+                "field_name": field_name,
+                "error_type": "anomaly_rare_code",
+                "count": len(rare_values),
+                "samples": rare_values[:12],
+            })
+            _try_store_exception(exceptions, stored_rows_by_type, {
+                "row_number": 0,
+                "field_name": field_name,
+                "actual_value": ", ".join(rare_values[:12]),
+                "expected_value": "Common domain value",
+                "error_type": "anomaly_rare_code",
+                "severity": "warning",
+            })
+
     stats = {
         "total_records": total_rows,
         "valid_rows": valid_rows,
@@ -208,6 +262,7 @@ def run_validation_from_path(
         "health_score": health_score,
         "errors_by_field": [{"field": k, "count": v} for k, v in errors_by_field.items()],
         "errors_by_type": errors_by_type_chart,
+        "rare_anomalies": rare_anomalies,
     }
     return result_bytes, stats, exceptions
 

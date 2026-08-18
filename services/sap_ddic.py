@@ -105,6 +105,26 @@ def load_catalog() -> dict[str, Any]:
     return json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
 
 
+def fields_for_table(table: str) -> list[dict[str, Any]]:
+    wanted = (table or "").strip().upper()
+    if not wanted:
+        return []
+    catalog = load_catalog()
+    out: list[dict[str, Any]] = []
+    for row in catalog.get("fields") or []:
+        if str(row.get("table") or "").upper() != wanted:
+            continue
+        out.append({
+            "sap_table": wanted,
+            "sap_field": str(row.get("field") or "").upper(),
+            "description": row.get("description") or "",
+            "datatype": row.get("datatype") or "",
+            "length": row.get("length"),
+            "decimals": row.get("decimals"),
+        })
+    return out
+
+
 def templates_from_ddic() -> list[dict[str, Any]]:
     catalog = load_catalog()
     rows = list(catalog.get("fields") or [])

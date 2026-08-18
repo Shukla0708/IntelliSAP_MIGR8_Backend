@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 
 from sqlalchemy.orm import Session
@@ -17,7 +18,8 @@ from db.models import (
     ValidationRun,
 )
 from schemas.chat import ChatContextIn, ChatRequest, ChatResponse
-from services import bedrock_llm
+from services import bedrock_llm, sap_mcp
+from config import settings
 
 MAX_HISTORY = 6
 MAX_RUNS = 20
@@ -70,6 +72,9 @@ def answer(db: Session, user: User, payload: ChatRequest) -> ChatResponse:
         return ChatResponse(reply=refusal, refused=True, page=page)
 
     pack = build_context_pack(db, user, payload.context)
+    sap_table = _requested_sap_table(message)
+    if sap_table:
+        pack["sap_table_fields"] = sap_mcp.get_table_fields(sap_table, db)
     history_block = _format_history(payload.history[-MAX_HISTORY:])
     user_prompt = (
         f"Context pack:\n{json.dumps(pack, default=str)}\n\n"
@@ -77,7 +82,15 @@ def answer(db: Session, user: User, payload: ChatRequest) -> ChatResponse:
         f"User question: {message}"
     )
     try:
-        reply = bedrock_llm.chat(SYSTEM_PROMPT, user_prompt, max_tokens=500)
+        reply = bedrock_llm.chat(
+            SYSTEM_PROMPT,
+            user_prompt,
+            max_tokens=400,
+            model_id=settings.bedrock_haiku_model_id,
+            purpose="chat",
+            use_cache=False,
+            user_id=str(user.id),
+        )
     except Exception as exc:
         raise ValueError(f"Chat model failed: {exc}") from exc
     return ChatResponse(
@@ -125,6 +138,18 @@ def _humanize_reply(text: str) -> str:
     while out and out[-1] == "":
         out.pop()
     return "\n".join(out)
+
+
+def _requested_sap_table(message: str) -> str | None:
+    lowered = message.lower()
+    if "field" not in lowered and "table" not in lowered:
+        return None
+    match = re.search(r"\b([a-z]{3,6})\b", lowered)
+    # Prefer explicit SAP table tokens.
+    for token in re.findall(r"\b([A-Za-z][A-Za-z0-9]{2,5})\b", message):
+        if token.upper() in {"MARA", "MARC", "KNA1", "LFA1", "BKPF", "BSEG", "VBAK", "VBAP", "LIKP", "LIPS", "EKKO", "EKPO"}:
+            return token.upper()
+    return None
 
 
 def _prefilter(message: str, history: list) -> str | None:

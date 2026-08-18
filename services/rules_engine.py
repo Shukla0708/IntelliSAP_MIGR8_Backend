@@ -144,7 +144,51 @@ def validate_cell(value, field_cfg: dict, seen_keys: set | None) -> list[str]:
         else:
             seen_keys.add(key_raw)
 
+    reasons.extend(anomaly_reasons(raw, field_cfg, value))
     return reasons
+
+
+JUNK_LITERALS = {"null", "#n/a", "#na", "n/a", "none", "#value!", "#ref!"}
+_NUMC_MIXED = re.compile(r"[A-Za-z].*\d|\d.*[A-Za-z]")
+
+
+def anomaly_reasons(raw: str, field_cfg: dict, value=None) -> list[str]:
+    """O(1) deterministic warnings — called from the existing per-cell loop."""
+    extra: list[str] = []
+    if isinstance(value, str) and value != raw and value.strip() != value:
+        extra.append("anomaly_whitespace")
+    elif isinstance(value, str) and value != value.strip():
+        extra.append("anomaly_whitespace")
+
+    lowered = raw.lower()
+    if lowered in JUNK_LITERALS and not field_cfg.get("flag_null"):
+        extra.append("anomaly_junk")
+
+    dt = (field_cfg.get("data_type") or "").lower()
+    if dt in ("numc", "int") and _NUMC_MIXED.search(raw):
+        extra.append("anomaly_mixed_alnum")
+
+    if field_cfg.get("flag_date") or dt == "date":
+        parsed = None
+        if isinstance(value, datetime):
+            parsed = value.date()
+        elif isinstance(value, date):
+            parsed = value
+        else:
+            for fmt in DATE_FORMATS:
+                try:
+                    parsed = datetime.strptime(raw, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        if parsed and (parsed.year < 1900 or parsed.year > 2099):
+            extra.append("anomaly_date_range")
+
+    allow = field_cfg.get("allowlist")
+    if allow and raw not in allow and raw.upper() not in allow:
+        extra.append("anomaly_domain")
+
+    return extra
 
 
 def _is_valid_date(value, raw: str) -> bool:

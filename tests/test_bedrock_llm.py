@@ -65,11 +65,12 @@ def test_rank_candidates_reorders(mock_chat):
 
 
 @patch("services.llm_mapping.bedrock_llm.chat")
-def test_rank_candidates_raises_on_empty(mock_chat):
-    mock_chat.return_value = "[]"
-    with pytest.raises(ValueError, match="no usable candidates"):
-        llm_mapping.rank_candidates("X", None, [{
-            "sap_table": "T",
-            "sap_field": "F",
-            "embedding_score": 0.5,
-        }])
+def test_rank_candidates_falls_back_when_llm_empty(mock_chat):
+    mock_chat.return_value = '{"results":[]}'
+    ranked = llm_mapping.rank_candidates("X", None, [{
+        "sap_table": "T",
+        "sap_field": "F",
+        "embedding_score": 0.5,
+    }])
+    assert ranked[0]["sap_field"] == "F"
+    assert "unavailable" in ranked[0]["reasoning"].lower()

@@ -3,6 +3,8 @@ import re
 
 from services import bedrock_llm
 
+from config import settings
+
 SYSTEM_PROMPT = (
     "You convert a plain-English data validation rule into a single "
     "Python-compatible regex used with re.fullmatch (do NOT include ^ or $). "
@@ -26,7 +28,9 @@ def generate_regex(field_name: str, user_prompt: str) -> str:
     raw = bedrock_llm.chat(
         SYSTEM_PROMPT,
         f"Field name: {field_name}\nRule: {prompt}",
-        max_tokens=1000,
+        max_tokens=400,
+        model_id=settings.bedrock_haiku_model_id,
+        purpose="regex",
     )
     raw = bedrock_llm.strip_markdown_fences(raw)
 

@@ -1,5 +1,6 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
@@ -9,7 +10,7 @@ from db.database import get_db
 from db.models import User, ValidationProject, Mapping, MappingTemp, FinalMapping
 from auth import get_current_user
 from schemas import ConfirmMappingRequest, RenameMappingRequest
-from services import job_queue, s3_service, file_parser
+from services import job_queue, s3_service, file_parser, learned_rules, sap_mcp
 
 NUMBER_RANGE_TYPES = ("internal", "external")
 DEFAULT_MAPPING_NAME = "New field mapping run"
@@ -247,6 +248,28 @@ def mapping_stats(
     }
 
 
+class SapTableRequest(BaseModel):
+    table: str
+
+
+@router.post("/sap-fields")
+def fetch_sap_fields(
+    payload: SapTableRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    table = (payload.table or "").strip().upper()
+    if not table:
+        raise HTTPException(422, "Enter an SAP table name such as MARA.")
+    result = sap_mcp.get_table_fields(table, db)
+    if not result.get("fields"):
+        raise HTTPException(
+            404,
+            f"No fields found for {table}. Check the table name or upload a target file.",
+        )
+    return result
+
+
 @router.post("/")
 async def create_mapping_run(
     project_id: uuid.UUID,
@@ -401,6 +424,8 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
             )
             db.add(existing)
         confirmed.append(existing)
+        table, field = _split_target_field(item.target_field)
+        learned_rules.upsert_mapping(db, item.source_field, table, field, current_user.id)
 
     mapping.status = "completed"
     db.commit()

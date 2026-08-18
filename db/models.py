@@ -14,6 +14,8 @@ class User(Base):
     full_name = Column(String, nullable=False)
     email = Column(String, nullable=False, unique=True)
     password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default="member")  # member | admin
+    is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     projects = relationship("ValidationProject", back_populates="user", cascade="all, delete-orphan")
@@ -232,3 +234,90 @@ class ComparisonDiscrepancy(Base):
     difference_type = Column(String, nullable=False)
     severity = Column(String, default="warning")  # error | warning | info
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=False, default="")
+    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserInvite(Base):
+    __tablename__ = "user_invites"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, nullable=False, unique=True)
+    invited_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    used_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class LearnedFieldRule(Base):
+    """Org-wide human-confirmed validation rule, keyed by SAP field identity."""
+    __tablename__ = "learned_field_rules"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    canonical_key = Column(String, nullable=False, unique=True)
+    aliases = Column(Text, default="")
+    org_id = Column(UUID(as_uuid=True), nullable=True)
+    active = Column(Boolean, default=True)
+
+    flag_mandatory = Column(Boolean, default=False)
+    flag_null = Column(Boolean, default=False)
+    flag_email = Column(Boolean, default=False)
+    flag_mobile = Column(Boolean, default=False)
+    flag_date = Column(Boolean, default=False)
+    flag_special_chars = Column(Boolean, default=False)
+    case_format = Column(String)
+    data_type = Column(String, default="string")
+    max_length = Column(Integer)
+    decimal_length = Column(Integer)
+    regex = Column(Text)
+    regex_prompt = Column(Text)
+
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    use_count = Column(Integer, default=0)
+
+
+class LearnedFieldMapping(Base):
+    """Org-wide confirmed source → SAP field mapping."""
+    __tablename__ = "learned_field_mappings"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_canonical = Column(String, nullable=False, unique=True)
+    sap_table = Column(String, nullable=False)
+    sap_field = Column(String, nullable=False)
+    org_id = Column(UUID(as_uuid=True), nullable=True)
+    active = Column(Boolean, default=True)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    use_count = Column(Integer, default=0)
+
+
+class LlmResponseCache(Base):
+    __tablename__ = "llm_response_cache"
+    prompt_hash = Column(String(64), primary_key=True)
+    model_id = Column(String, nullable=False)
+    response_text = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class EmbeddingCache(Base):
+    __tablename__ = "embedding_cache"
+    text_hash = Column(String(64), primary_key=True)
+    model_id = Column(String, nullable=False)
+    vector = Column(JSONB, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class LlmUsageLog(Base):
+    __tablename__ = "llm_usage_log"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    purpose = Column(String, nullable=False, default="generic")
+    model_id = Column(String, nullable=False)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    latency_ms = Column(Integer, default=0)
+    cache_hit = Column(Boolean, default=False)
+    estimated_usd = Column(Numeric(12, 6), default=0)

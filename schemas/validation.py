@@ -37,7 +37,7 @@ class FieldRuleIn(BaseModel):
     @field_validator("rule_source")
     @classmethod
     def normalize_rule_source(cls, value: Optional[str]) -> str:
-        if value in ("user", "ai", "default"):
+        if value in ("user", "ai", "default", "learned"):
             return value
         return "default"
 
