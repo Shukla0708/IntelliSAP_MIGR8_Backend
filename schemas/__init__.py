@@ -18,7 +18,7 @@ from schemas.comparison import (
     CreateComparisonRequest,
     ExecuteComparisonRequest,
 )
-from schemas.chat import ChatRequest, ChatResponse, ChatContextIn, ChatTurn
+from schemas.chat import ChatRequest, ChatResponse, ChatContextIn, ChatTurn, ChatActionOut
 
 __all__ = [
     "RegisterRequest",
@@ -47,4 +47,5 @@ __all__ = [
     "ChatResponse",
     "ChatContextIn",
     "ChatTurn",
+    "ChatActionOut",
 ]

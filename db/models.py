@@ -57,6 +57,7 @@ class ValidationRun(Base):
 
     errors_by_type = Column(JSONB, default=list)
     errors_by_field = Column(JSONB, default=list)
+    duplicate_groups = Column(JSONB)
 
     processed_rows = Column(Integer, default=0)
     total_rows = Column(Integer, default=0)

@@ -20,7 +20,14 @@ from db.models import (
     ValidationField,
     ValidationRun,
 )
-from services import comparison_engine, comparison_file_service, excel_service, s3_service
+from services import (
+    comparison_engine,
+    comparison_file_service,
+    entity_resolution,
+    excel_service,
+    s3_service,
+    semantic_match,
+)
 from services.mapping_pipeline import run_mapping_job
 
 logger = logging.getLogger(__name__)
@@ -75,6 +82,7 @@ def _ensure_runtime_columns() -> None:
         "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS processed_rows INT DEFAULT 0",
         "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS total_rows INT DEFAULT 0",
         "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS error_message TEXT",
+        "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS duplicate_groups JSONB",
     ]
     try:
         with engine.begin() as conn:
@@ -155,6 +163,7 @@ def _run_validation_job(run_id: uuid.UUID) -> None:
 
         suffix = ".csv" if (run.source_filename or "").lower().endswith(".csv") else ".xlsx"
         tmp = s3_service.download_to_temp(run.source_s3_key, suffix=suffix)
+        duplicate_groups = None
         try:
             result_bytes, stats, exceptions = excel_service.run_validation_from_path(
                 tmp,
@@ -162,6 +171,12 @@ def _run_validation_job(run_id: uuid.UUID) -> None:
                 field_configs,
                 on_progress,
             )
+            try:
+                duplicate_groups = entity_resolution.scan_file(
+                    tmp, run.source_filename or "source.xlsx",
+                )
+            except Exception:
+                logger.exception("Entity resolution skipped for run %s", run_id)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -185,6 +200,8 @@ def _run_validation_job(run_id: uuid.UUID) -> None:
         run.status = "completed"
         run.completed_at = datetime.utcnow()
         run.error_message = None
+        if duplicate_groups is not None:
+            run.duplicate_groups = duplicate_groups
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -229,6 +246,8 @@ def _run_comparison_job(run_id: uuid.UUID) -> None:
         result_bytes, stats, discrepancies = comparison_engine.run_comparison(
             preload_bytes, postload_bytes, plan,
         )
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            discrepancies = semantic_match.reclassify_discrepancies(discrepancies)
 
         result_key = f"comparisons/{run_id}/result/comparison_{run.preload_filename}"
         s3_service.upload_bytes(

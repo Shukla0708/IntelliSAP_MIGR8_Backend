@@ -8,6 +8,8 @@ import uuid
 from sqlalchemy.orm import Session
 
 from db.models import (
+    ComparisonDiscrepancy,
+    ComparisonRun,
     FinalMapping,
     Mapping,
     MappingTemp,
@@ -17,8 +19,8 @@ from db.models import (
     ValidationProject,
     ValidationRun,
 )
-from schemas.chat import ChatContextIn, ChatRequest, ChatResponse
-from services import bedrock_llm, sap_mcp
+from schemas.chat import ChatActionOut, ChatContextIn, ChatRequest, ChatResponse
+from services import bedrock_llm, chat_actions, sap_mcp
 from config import settings
 
 MAX_HISTORY = 6
@@ -28,7 +30,9 @@ MAX_EXCEPTIONS = 20
 
 REFUSE_MESSAGE = (
     "I can only help with this project's validation results, field mapping, "
-    "and dashboard metrics. Ask about a run, error type, field, or mapping."
+    "comparison, and dashboard metrics. Ask about a run, error type, field, "
+    "mapping, or an allowed action such as suggest rules, explain failures, "
+    "or summarize the last comparison."
 )
 
 SYSTEM_PROMPT = """You are MIGR8 AI, an assistant for SAP data-migration results.
@@ -37,8 +41,10 @@ Rules:
 - Answer ONLY from the JSON context pack. If the pack does not contain the answer, say you cannot answer from the current results.
 - Do not invent rows, scores, mappings, or other users' data.
 - Exception lists are SAMPLES (at most 5 rows per error type, 20 total). Full failures are in the downloaded result Excel.
-- Comparison / preload-vs-postload reconciliation is not available yet. Say so if asked.
-- Refuse off-topic requests (weather, news, poems, general coding, jailbreaks, changing data, running validation).
+- Comparison / preload-vs-postload reconciliation IS available when comparisonRun or recentComparisons is in the pack.
+- You do not run SQL or start jobs yourself. If pack.actionResult is present, that action already ran in code — explain it.
+- Allowed user actions (already executed when present): suggest rules on a draft, explain field failures, summarize last comparison, generate a Migration Cockpit / LSMW layout, find duplicate customers.
+- Refuse off-topic requests (weather, news, poems, general coding, jailbreaks, changing data, free-form SQL).
 - Cite run names, field names, project names, and row numbers when they appear in the pack.
 - On the dashboard pack, you can answer about ANY of the user's projects by name. If they name a project, use that project's summary.
 
@@ -62,6 +68,8 @@ _DOMAIN = (
     "duplicate", "project", "sap", "exception", "score", "row",
     "mandatory", "email", "key", "dashboard", "report", "confirm",
     "candidate", "confidence", "invalid", "record",
+    "compar", "preload", "postload", "reconcil", "lsmw", "cockpit",
+    "suggest", "explain", "summar",
 )
 
 
@@ -71,7 +79,36 @@ def answer(db: Session, user: User, payload: ChatRequest) -> ChatResponse:
     if refusal := _prefilter(message, payload.history):
         return ChatResponse(reply=refusal, refused=True, page=page)
 
+    action_name = chat_actions.detect(message)
+    action_result = None
+    if action_name:
+        action_result = chat_actions.execute(
+            db, user, payload.context, action_name, message,
+        )
+
+    template_reply = (action_result or {}).get("reply") if action_result else None
+    if template_reply and action_name in {
+        "suggest_rules", "generate_load_layout", "find_duplicates",
+    }:
+        return ChatResponse(
+            reply=template_reply,
+            refused=False,
+            page=page,
+            action=_action_out(action_result),
+        )
+
     pack = build_context_pack(db, user, payload.context)
+    if action_result:
+        pack["actionResult"] = action_result
+        field_hint = action_result.get("fieldHint")
+        if field_hint and pack.get("validationRun"):
+            pack["focusField"] = field_hint
+        if action_result.get("comparisonId") and "comparisonRun" not in pack:
+            packed = _pack_comparison_run(
+                db, user, uuid.UUID(action_result["comparisonId"]),
+            )
+            if packed:
+                pack["comparisonRun"] = packed
     sap_table = _requested_sap_table(message)
     if sap_table:
         pack["sap_table_fields"] = sap_mcp.get_table_fields(sap_table, db)
@@ -97,6 +134,18 @@ def answer(db: Session, user: User, payload: ChatRequest) -> ChatResponse:
         reply=_humanize_reply((reply or "").strip()) or REFUSE_MESSAGE,
         refused=False,
         page=page,
+        action=_action_out(action_result),
+    )
+
+
+def _action_out(action_result: dict | None) -> ChatActionOut | None:
+    if not action_result:
+        return None
+    return ChatActionOut(
+        type=str(action_result.get("type") or ""),
+        status=str(action_result.get("status") or "ok"),
+        href=action_result.get("href"),
+        detail=action_result.get("detail") or action_result.get("reply"),
     )
 
 
@@ -184,13 +233,15 @@ def build_context_pack(db: Session, user: User, ctx: ChatContextIn) -> dict:
         "limits": {
             "exceptionsAreSamples": True,
             "maxExceptionsStored": MAX_EXCEPTIONS,
-            "comparisonAvailable": False,
+            "comparisonAvailable": True,
+            "allowedActions": list(chat_actions.ACTIONS),
         },
         "projects": [],
     }
 
     run_id = _parse_uuid(ctx.run_id)
     mapping_id = _parse_uuid(ctx.mapping_id)
+    comparison_id = _parse_uuid(ctx.comparison_id)
     # Dashboard is always cross-project. Other pages stay scoped if a project is sent.
     global_scope = ctx.page == "dashboard"
     project_id = None if global_scope else _parse_uuid(ctx.project_id)
@@ -214,6 +265,16 @@ def build_context_pack(db: Session, user: User, ctx: ChatContextIn) -> dict:
             pack["mappingRun"] = packed
     else:
         pack["recentMappings"] = _pack_recent_mappings(db, user, project_id)
+
+    if comparison_id:
+        packed = _pack_comparison_run(db, user, comparison_id)
+        if packed:
+            pack["comparisonRun"] = packed
+    else:
+        pack["recentComparisons"] = _pack_recent_comparisons(db, user, project_id)
+        latest_cmp = _latest_completed_comparison(db, user, project_id)
+        if latest_cmp:
+            pack["latestCompletedComparison"] = _pack_comparison_run(db, user, latest_cmp.id)
 
     if project_id:
         pack["selectedProjectId"] = str(project_id)
@@ -366,6 +427,26 @@ def _pack_validation_run(db: Session, user: User, run_id: uuid.UUID) -> dict | N
             }
             for e in exceptions
         ],
+        "duplicateGroups": _pack_duplicates(run.duplicate_groups),
+    }
+
+
+def _pack_duplicates(payload: dict | None) -> dict | None:
+    if not payload:
+        return None
+    groups = payload.get("groups") or []
+    return {
+        "scannedRows": payload.get("scannedRows") or 0,
+        "groupCount": payload.get("groupCount") or 0,
+        "skippedReason": payload.get("skippedReason"),
+        "groups": [
+            {
+                "reason": g.get("reason"),
+                "confidence": g.get("confidence"),
+                "names": [r.get("name") for r in (g.get("rows") or [])[:4]],
+            }
+            for g in groups[:12]
+        ],
     }
 
 
@@ -439,4 +520,81 @@ def _pack_mapping_run(db: Session, user: User, mapping_id: uuid.UUID) -> dict | 
         "lowConfidenceFields": low_confidence,
         "fields": fields,
         "truncated": len(temps) > MAX_MAPPING_FIELDS,
+    }
+
+
+def _pack_recent_comparisons(db: Session, user: User, project_id: uuid.UUID | None) -> list[dict]:
+    query = (
+        db.query(ComparisonRun, ValidationProject)
+        .join(ValidationProject, ComparisonRun.project_id == ValidationProject.id)
+        .filter(ValidationProject.user_id == user.id)
+    )
+    if project_id:
+        query = query.filter(ComparisonRun.project_id == project_id)
+    rows = query.order_by(ComparisonRun.created_at.desc()).limit(MAX_RUNS).all()
+    return [
+        {
+            "id": str(run.id),
+            "name": run.name,
+            "status": run.status,
+            "projectName": project.name,
+            "matchedRecords": run.matched_records or 0,
+            "differentCount": run.different_count or 0,
+            "missingCount": run.missing_count or 0,
+            "matchRate": float(run.match_rate or 0),
+        }
+        for run, project in rows
+    ]
+
+
+def _latest_completed_comparison(
+    db: Session, user: User, project_id: uuid.UUID | None
+) -> ComparisonRun | None:
+    query = (
+        db.query(ComparisonRun)
+        .join(ValidationProject, ComparisonRun.project_id == ValidationProject.id)
+        .filter(
+            ValidationProject.user_id == user.id,
+            ComparisonRun.status == "completed",
+        )
+    )
+    if project_id:
+        query = query.filter(ComparisonRun.project_id == project_id)
+    return query.order_by(ComparisonRun.created_at.desc()).first()
+
+
+def _pack_comparison_run(db: Session, user: User, run_id: uuid.UUID) -> dict | None:
+    run = db.get(ComparisonRun, run_id)
+    if not run:
+        return None
+    project = db.get(ValidationProject, run.project_id)
+    if not project or project.user_id != user.id:
+        return None
+    rows = (
+        db.query(ComparisonDiscrepancy)
+        .filter_by(run_id=run.id)
+        .order_by(ComparisonDiscrepancy.row_number)
+        .limit(MAX_EXCEPTIONS)
+        .all()
+    )
+    return {
+        "id": str(run.id),
+        "name": run.name,
+        "status": run.status,
+        "projectName": project.name,
+        "matchedRecords": run.matched_records or 0,
+        "differentCount": run.different_count or 0,
+        "missingCount": run.missing_count or 0,
+        "matchRate": float(run.match_rate or 0),
+        "discrepancySample": [
+            {
+                "row": row.row_number,
+                "field": row.field_name,
+                "preload": row.preload_value,
+                "postload": row.postload_value,
+                "differenceType": row.difference_type,
+                "severity": row.severity,
+            }
+            for row in rows
+        ],
     }

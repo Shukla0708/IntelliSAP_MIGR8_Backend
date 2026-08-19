@@ -154,6 +154,7 @@ def _ensure_production_schema() -> None:
             created_at TIMESTAMPTZ DEFAULT now()
         )
         """,
+        "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS duplicate_groups JSONB",
         """
         CREATE TABLE IF NOT EXISTS llm_usage_log (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

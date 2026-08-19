@@ -505,6 +505,13 @@ pytest tests/test_comparison.py -q
 
 ## Session Log
 
+### 2026-08-19 — Ideas 9–12 (entity resolution, copilot, load layout, semantic match)
+
+- Duplicate groups on completed validation runs (`duplicate_groups` JSONB, `migrations/006_duplicate_groups.sql`); results page panel.
+- Chat allow-listed actions: suggest rules, explain failures, summarize comparison, generate load layout, find duplicates. Comparison results packed into chat.
+- `GET /api/mappings/{id}/load-layout?format=csv|xml` — Migration Cockpit CSV / LSMW XML from confirmed mappings.
+- Comparison `SEMANTIC_MATCH` (Inc/Incorporated, GmbH/LLC) on the row path; LLM reclassify of remaining top-50 VALUE_MISMATCH only.
+
 ### 2026-08-14 — Large-file validation
 
 - `POST /api/runs/{id}/execute` returns **202**; in-process worker validates and writes a full annotated XLSX.

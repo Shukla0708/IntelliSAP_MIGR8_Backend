@@ -114,6 +114,8 @@ def test_context_pack_includes_latest_run(db, auth_user):
     latest = pack["latestCompletedValidationRun"]
     assert latest["name"] == "Sales check"
     assert latest["exceptionSample"][0]["field"] == "CustomerID"
+    assert pack["limits"]["comparisonAvailable"] is True
+    assert "suggest_rules" in pack["limits"]["allowedActions"]
 
 
 @patch("services.chat_service.bedrock_llm.chat", return_value="CustomerID is duplicated on row 4.")

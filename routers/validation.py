@@ -1,6 +1,7 @@
 import logging
 import uuid
 from datetime import datetime
+from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
@@ -16,7 +17,7 @@ from db.models import (
     ValidationRun,
 )
 from auth import get_current_user
-from services import s3_service, regex_generator, file_stream, job_queue, rule_suggester, rule_templates, learned_rules
+from services import s3_service, regex_generator, file_stream, job_queue, rule_suggester, rule_templates, learned_rules, entity_resolution
 from schemas import (
     CreateRunRequest,
     FieldRuleIn,
@@ -358,6 +359,7 @@ def get_result(run_id: uuid.UUID, db: Session = Depends(get_db),
         "totalRows": run.total_rows or 0,
         "errorMessage": run.error_message,
         "hasResultFile": bool(run.result_s3_key),
+        "duplicateGroups": _duplicate_payload(db, run),
         "exceptions": [{
             "id": str(e.id),
             "severity": e.severity,
@@ -369,6 +371,25 @@ def get_result(run_id: uuid.UUID, db: Session = Depends(get_db),
             "actionLabel": "Fix" if e.severity == "error" else "View",
         } for e in exceptions],
     }
+
+
+def _duplicate_payload(db: Session, run: ValidationRun) -> dict | None:
+    if run.status != "completed" or not run.source_s3_key:
+        return run.duplicate_groups
+    if run.duplicate_groups:
+        return run.duplicate_groups
+    suffix = Path(run.source_filename or "source.xlsx").suffix or ".xlsx"
+    tmp = s3_service.download_to_temp(run.source_s3_key, suffix=suffix)
+    try:
+        payload = entity_resolution.scan_file(tmp, run.source_filename or "source.xlsx")
+    except Exception:
+        logger.exception("Entity resolution failed for run %s", run.id)
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+    run.duplicate_groups = payload
+    db.commit()
+    return payload
 
 
 @router.get("/{run_id}/download-url")

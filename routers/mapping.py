@@ -1,7 +1,7 @@
 import uuid
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -10,7 +10,7 @@ from db.database import get_db
 from db.models import User, ValidationProject, Mapping, MappingTemp, FinalMapping
 from auth import get_current_user
 from schemas import ConfirmMappingRequest, RenameMappingRequest
-from services import job_queue, s3_service, file_parser, learned_rules, sap_mcp
+from services import job_queue, s3_service, file_parser, learned_rules, sap_mcp, load_layout
 
 NUMBER_RANGE_TYPES = ("internal", "external")
 DEFAULT_MAPPING_NAME = "New field mapping run"
@@ -437,3 +437,70 @@ def confirm_mapping(run_id: uuid.UUID, payload: ConfirmMappingRequest, db: Sessi
             "isKey": bool(c.key),
         } for c in confirmed],
     }
+
+
+def _layout_fields(db: Session, mapping: Mapping) -> list[dict]:
+    confirmed = (
+        db.query(FinalMapping)
+        .filter_by(mapping_id=mapping.id)
+        .order_by(FinalMapping.source_field)
+        .all()
+    )
+    temps = {
+        row.source_field: row
+        for row in db.query(MappingTemp).filter_by(mapping_id=mapping.id).all()
+    }
+    try:
+        catalog = {
+            f"{row['sap_table']}.{row['sap_field']}": row
+            for row in _target_catalog(mapping)
+        }
+    except HTTPException:
+        catalog = {}
+    fields = []
+    for row in confirmed:
+        catalog_row = catalog.get(row.target_field) or {}
+        description = catalog_row.get("description") or ""
+        if not description:
+            temp = temps.get(row.source_field)
+            for candidate in (temp.mapping or []) if temp else []:
+                if _candidate_key(candidate) == row.target_field:
+                    description = candidate.get("target_description") or ""
+                    break
+        fields.append({
+            "source_field": row.source_field,
+            "target_field": row.target_field,
+            "is_key": bool(row.key),
+            "description": description,
+            "datatype": catalog_row.get("datatype") or "",
+        })
+    return fields
+
+
+@router.get("/{run_id}/load-layout")
+def download_load_layout(
+    run_id: uuid.UUID,
+    format: str = Query("csv"),
+    notes: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CSV or XML Migration Cockpit / LSMW template from confirmed mappings."""
+    mapping = _get_owned_mapping(run_id, db, current_user)
+    fmt = (format or "csv").lower()
+    if fmt not in ("csv", "xml"):
+        raise HTTPException(422, "format must be csv or xml")
+    fields = _layout_fields(db, mapping)
+    if not fields:
+        raise HTTPException(409, "Confirm at least one field before generating a load layout")
+    body, media_type, filename = load_layout.build_layout(
+        mapping.mapping_name or "mapping",
+        fields,
+        fmt=fmt,
+        with_llm_notes=notes,
+    )
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

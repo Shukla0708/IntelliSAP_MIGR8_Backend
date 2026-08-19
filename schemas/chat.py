@@ -3,7 +3,13 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-ChatPage = Literal["dashboard", "report", "validation_result", "mapping_result"]
+ChatPage = Literal[
+    "dashboard",
+    "report",
+    "validation_result",
+    "mapping_result",
+    "comparison_result",
+]
 
 
 class ChatTurn(BaseModel):
@@ -16,6 +22,7 @@ class ChatContextIn(BaseModel):
     project_id: str | None = None
     run_id: str | None = None
     mapping_id: str | None = None
+    comparison_id: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -24,7 +31,15 @@ class ChatRequest(BaseModel):
     context: ChatContextIn = Field(default_factory=ChatContextIn)
 
 
+class ChatActionOut(BaseModel):
+    type: str
+    status: str
+    href: str | None = None
+    detail: str | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
     refused: bool = False
     page: ChatPage
+    action: ChatActionOut | None = None

@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
 from services.comparison_file_service import AnnotatedResultWriter, iter_data_rows
+from services.semantic_match import is_semantic_match
 
 MAX_DISCREPANCIES = 50
 KEY_DELIMITER = "\x1f"
@@ -25,6 +26,7 @@ _SEVERITY_BY_TYPE = {
     "EXTRA_RECORD": "error",
     "VALUE_MISMATCH": "warning",
     "FORMAT_CHANGE": "info",
+    "SEMANTIC_MATCH": "info",
 }
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 
@@ -111,6 +113,8 @@ def classify_difference(preload: str, postload: str) -> str | None:
     stripped = _alphanumeric(preload)
     if stripped and stripped == _alphanumeric(postload):
         return "FORMAT_CHANGE"
+    if is_semantic_match(preload, postload):
+        return "SEMANTIC_MATCH"
     return "VALUE_MISMATCH"
 
 
@@ -192,10 +196,11 @@ def run_comparison(
                 difference = classify_difference(preload_value, postload_value)
                 if difference is None:
                     continue
-                red_columns.add(pair.preload_index)
-                details.append(
-                    f"{pair.label}: preload={preload_value} | postload={postload_value}"
-                )
+                if difference != "SEMANTIC_MATCH":
+                    red_columns.add(pair.preload_index)
+                    details.append(
+                        f"{pair.label}: preload={preload_value} | postload={postload_value}"
+                    )
                 discrepancies.add({
                     "row_number": row_number,
                     "business_key": display_key,

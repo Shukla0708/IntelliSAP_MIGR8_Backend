@@ -36,3 +36,6 @@ def test_real_changes_are_not_swallowed():
     assert values_equivalent("100045", "100046") is False
     assert classify_difference("1000", "1000.01") == "VALUE_MISMATCH"
     assert classify_difference("john@x.com", "JOHN@X.COM") == "FORMAT_CHANGE"
+    assert classify_difference("ACME Inc", "ACME Incorporated") == "SEMANTIC_MATCH"
+    assert classify_difference("Globex GmbH", "Globex LLC") == "SEMANTIC_MATCH"
+    assert classify_difference("ACME Inc", "Globex Inc") == "VALUE_MISMATCH"
